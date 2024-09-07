@@ -27,62 +27,62 @@ pub fn pack_sequence_and_type(sequence_number: u64, value_type: ValueType) -> u6
 
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
 pub struct UserKey<'a> {
-    key: &'a [u8],
+    payload: &'a [u8],
 }
 
 impl<'a> UserKey<'a> {
     pub fn new<T: AsRef<[u8]> + ?Sized>(text: &'a T) -> Self {
         Self {
-            key: text.as_ref()
+            payload: text.as_ref()
         }
     }
 }
 
 impl<'a> AsRef<[u8]> for UserKey<'a> {
     fn as_ref(&self) -> &[u8] {
-        self.key
+        self.payload
     }
 }
 
 
 #[derive(Eq, PartialEq)]
 pub struct InternalKey {
-    key: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 impl InternalKey {
     const MIN_LEN: usize = 8;
 
     pub fn new<T: AsRef<[u8]> + ?Sized>(text: &T) -> Self {
-        let mut key = Vec::<u8>::with_capacity(16);
-        key.extend_from_slice(text.as_ref());
-        if key.len() < Self::MIN_LEN {
-            key.resize(Self::MIN_LEN, 0);
+        let mut payload = Vec::<u8>::with_capacity(16);
+        payload.extend_from_slice(text.as_ref());
+        if payload.len() < Self::MIN_LEN {
+            payload.resize(Self::MIN_LEN, 0);
         }
 
-        Self { key }
+        Self { payload }
     }
 
     pub fn restore<T: AsRef<[u8]>>(user_key: T, sequence_number: u64, value_type: ValueType) -> InternalKey {
-        let mut key = Vec::<u8>::with_capacity(user_key.as_ref().len() + 8);
-        key.extend_from_slice(user_key.as_ref());
-        coding::put_fixed64_into_vec(&mut key, pack_sequence_and_type(sequence_number, value_type));
-        Self { key }
+        let mut payload = Vec::<u8>::with_capacity(user_key.as_ref().len() + 8);
+        payload.extend_from_slice(user_key.as_ref());
+        coding::put_fixed64_into_vec(&mut payload, pack_sequence_and_type(sequence_number, value_type));
+        Self { payload }
     }
 
     pub fn extract_user_key(&self) -> UserKey {
-        UserKey::new(&self.key[..self.key.len() - Self::MIN_LEN])
+        UserKey::new(&self.payload[..self.payload.len() - Self::MIN_LEN])
     }
 
     pub fn extract_sequence(&self) -> u64 {
-        let info = &self.key[self.key.len() - Self::MIN_LEN..];
+        let info = &self.payload[self.payload.len() - Self::MIN_LEN..];
         let mut sequence = coding::decode_fixed64(info);
         sequence = sequence >> 8;
         sequence
     }
 
     pub fn extract_value_type(&self) -> ValueType {
-        let info = &self.key[self.key.len() - Self::MIN_LEN..];
+        let info = &self.payload[self.payload.len() - Self::MIN_LEN..];
         let sequence = coding::decode_fixed64(info);
         let value_type = (sequence & 0xff) as u8;
         value_type.into()
@@ -111,13 +111,13 @@ impl Ord for InternalKey {
 
 impl AsRef<[u8]> for InternalKey {
     fn as_ref(&self) -> &[u8] {
-        self.key.as_ref()
+        self.payload.as_ref()
     }
 }
 
 #[derive(Eq, PartialEq)]
 pub struct LookupKey {
-    key: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 impl LookupKey {
@@ -125,16 +125,28 @@ impl LookupKey {
         let key_size = text.as_ref().len() + 8;
         let size = key_size + coding::get_variant_length(key_size as u64);
 
-        let mut key = Vec::<u8>::with_capacity(size);
-        coding::put_variant32_into_vec(&mut key, key_size as u32);
-        key.extend_from_slice(text.as_ref());
-        coding::put_fixed64_into_vec(&mut key, pack_sequence_and_type(sequence_number, ValueType::Insertion));
-        Self { key }
+        let mut payload = Vec::<u8>::with_capacity(size);
+        coding::put_variant32_into_vec(&mut payload, key_size as u32);
+        payload.extend_from_slice(text.as_ref());
+        coding::put_fixed64_into_vec(&mut payload, pack_sequence_and_type(sequence_number, ValueType::Insertion));
+        Self { payload }
     }
 
     pub fn extract_internal_key(&self) -> InternalKey {
-        let (key, _) = coding::get_length_prefixed_slice(self.key.as_slice());
+        let (key, _) = coding::get_length_prefixed_slice(self.payload.as_slice());
         InternalKey::new(key)
+    }
+
+    pub fn get_raw_key(&self) -> &[u8] {
+        let (internal_key, _) = coding::get_length_prefixed_slice(self.payload.as_slice());
+        &internal_key[..internal_key.len() - InternalKey::MIN_LEN]
+    }
+
+    pub fn get_raw_value(&self) -> &[u8] {
+        let (internal_key, w) = coding::get_length_prefixed_slice(self.payload.as_slice());
+        let value_offset = internal_key.len() + w as usize;
+        let (value, _) = coding::get_length_prefixed_slice(&self.payload[value_offset..]);
+        value
     }
 }
 
@@ -154,6 +166,22 @@ impl Ord for LookupKey {
 
 impl AsRef<[u8]> for LookupKey {
     fn as_ref(&self) -> &[u8] {
-        self.key.as_ref()
+        self.payload.as_ref()
+    }
+}
+
+impl Default for LookupKey {
+    fn default() -> Self {
+        Self { payload: vec![0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] }
+    }
+}
+
+impl From<Vec<u8>> for LookupKey {
+    fn from(value: Vec<u8>) -> Self {
+        if value.len() < InternalKey::MIN_LEN + 2 {
+            Self::default()
+        } else {
+            Self { payload: value }
+        }
     }
 }
