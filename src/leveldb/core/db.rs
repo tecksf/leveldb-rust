@@ -7,6 +7,9 @@ pub struct Database {
 
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> std::io::Result<Self> {
+        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        log::info!("Opening database at path: {}", path.as_ref());
+
         let db = Database {
             name: String::new(),
         };
