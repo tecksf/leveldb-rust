@@ -1,5 +1,6 @@
 mod core;
 mod utils;
+mod logs;
 
 pub type DB = core::db::Database;
 
