@@ -1,3 +1,4 @@
+pub mod builder;
 mod block;
 
 const TABLE_MAGIC_NUMBER: u64 = 0xdb4775248b80fb57;

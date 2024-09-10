@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub trait WriterView {
-    fn append(&mut self, slice: &[u8]) -> io::Result<usize>;
+    fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize>;
     fn sync(&mut self) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
 }
@@ -34,8 +34,8 @@ impl WritableFile {
 }
 
 impl WriterView for WritableFile {
-    fn append(&mut self, slice: &[u8]) -> io::Result<usize> {
-        self.file_handle.write(slice)
+    fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize> {
+        self.file_handle.write(slice.as_ref())
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -92,9 +92,9 @@ pub mod tests {
     }
 
     impl<'a> WriterView for WritableMemory<'a> {
-        fn append(&mut self, slice: &[u8]) -> io::Result<usize> {
-            self.data.extend_from_slice(slice);
-            Ok(slice.len())
+        fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize> {
+            self.data.extend_from_slice(slice.as_ref());
+            Ok(slice.as_ref().len())
         }
 
         fn sync(&mut self) -> io::Result<()> { Ok(()) }

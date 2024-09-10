@@ -1,3 +1,3 @@
 pub mod filename;
-mod file;
-mod wal;
+pub mod file;
+pub mod wal;
