@@ -21,8 +21,17 @@ impl From<u8> for ValueType {
     }
 }
 
+pub const INSERTION_TYPE_FOR_SEEK: ValueType = ValueType::Insertion;
+pub const MAX_SEQUENCE_NUMBER: u64 = (0x1 << 56) - 1;
+
 pub fn pack_sequence_and_type(sequence_number: u64, value_type: ValueType) -> u64 {
     (sequence_number << 8) | value_type as u64
+}
+
+pub trait Comparator {
+    fn name() -> String;
+    fn find_shortest_separator(&self, other: &Self) -> Vec<u8>;
+    fn find_shortest_successor(&self) -> Vec<u8>;
 }
 
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
@@ -36,6 +45,10 @@ impl<'a> UserKey<'a> {
             payload: text.as_ref()
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
 }
 
 impl<'a> AsRef<[u8]> for UserKey<'a> {
@@ -44,8 +57,43 @@ impl<'a> AsRef<[u8]> for UserKey<'a> {
     }
 }
 
+impl Comparator for UserKey<'_> {
+    fn name() -> String {
+        String::from("leveldb.BytewiseComparator")
+    }
 
-#[derive(Eq, PartialEq)]
+    fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
+        let min_length = std::cmp::min(self.len(), other.len());
+        let mut diff_index = 0;
+        while diff_index < min_length && self.payload[diff_index] == other.payload[diff_index] {
+            diff_index += 1;
+        }
+
+        let mut ans = Vec::from(&self.payload[..diff_index]);
+        if diff_index < min_length {
+            let diff_byte = self.payload[diff_index];
+            if diff_byte < 0xff && diff_byte + 1 < other.payload[diff_index] {
+                ans.push(diff_byte + 1);
+            }
+        }
+        ans
+    }
+
+    fn find_shortest_successor(&self) -> Vec<u8> {
+        let mut ans = Vec::from(self.payload);
+        for (i, &n) in self.payload.iter().enumerate() {
+            if n != 0xff {
+                ans[i] = n + 1;
+                ans.truncate(i + 1);
+                break;
+            }
+        }
+        ans
+    }
+}
+
+
+#[derive(Eq, PartialEq, Clone)]
 pub struct InternalKey {
     payload: Vec<u8>,
 }
@@ -61,6 +109,15 @@ impl InternalKey {
         }
 
         Self { payload }
+    }
+
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn assign(&mut self, other: &Self) {
+        self.payload.clear();
+        self.payload.extend_from_slice(&other.payload);
     }
 
     pub fn restore<T: AsRef<[u8]>>(user_key: T, sequence_number: u64, value_type: ValueType) -> InternalKey {
@@ -112,6 +169,42 @@ impl Ord for InternalKey {
 impl AsRef<[u8]> for InternalKey {
     fn as_ref(&self) -> &[u8] {
         self.payload.as_ref()
+    }
+}
+
+impl Default for InternalKey {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl Comparator for InternalKey {
+    fn name() -> String {
+        String::from("leveldb.InternalKeyComparator")
+    }
+
+    fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
+        let start = self.extract_user_key();
+        let limit = other.extract_user_key();
+
+        // tmp: ad
+        // start: abc
+        let mut tmp = start.find_shortest_separator(&limit);
+        let tmp_user_key = UserKey::new(&tmp);
+        if tmp.len() < start.len() && start.cmp(&tmp_user_key) == Ordering::Less {
+            coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(MAX_SEQUENCE_NUMBER, INSERTION_TYPE_FOR_SEEK));
+        }
+        tmp
+    }
+
+    fn find_shortest_successor(&self) -> Vec<u8> {
+        let user_key = self.extract_user_key();
+        let mut tmp = user_key.find_shortest_successor();
+        let tmp_user_key = UserKey::new(&tmp);
+        if tmp_user_key.len() < user_key.len() && user_key.cmp(&tmp_user_key).is_lt() {
+            coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(MAX_SEQUENCE_NUMBER, INSERTION_TYPE_FOR_SEEK));
+        }
+        tmp
     }
 }
 
@@ -183,5 +276,65 @@ impl From<Vec<u8>> for LookupKey {
         } else {
             Self { payload: value }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UserKey, InternalKey, Comparator, ValueType};
+
+    #[test]
+    fn test_user_key_shortest_separator() {
+        let cases: [(&str, &str, &str); 3] = [
+            ("abc", "abk", "abd"),
+            ("1234", "123978", "1235"),
+            ("java", "javascript", "java"),
+        ];
+
+        for (key1, key2, expected) in cases {
+            let user_key1 = UserKey::new(key1);
+            let user_key2 = UserKey::new(key2);
+            assert_eq!(user_key1.find_shortest_separator(&user_key2), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_user_key_shortest_successor() {
+        let cases: [(&str, &str); 2] = [
+            ("abc", "b"),
+            ("123", "2"),
+        ];
+
+        for (key, expected) in cases {
+            let user_key = UserKey::new(key);
+            assert_eq!(user_key.find_shortest_successor(), expected.as_bytes());
+        }
+
+        let user_key = UserKey::new([0xff, 0x01].as_slice());
+        assert_eq!(user_key.find_shortest_successor(), [0xff, 0x02]);
+    }
+
+    #[test]
+    fn test_internal_key_convert_to_user_key() {
+        let internal_key = InternalKey::restore("123", 99, ValueType::Insertion);
+        let user_key = internal_key.extract_user_key();
+        assert_eq!(user_key.as_ref(), "123".as_bytes());
+        assert_eq!(internal_key.extract_value_type(), ValueType::Insertion);
+        assert_eq!(internal_key.extract_sequence(), 99);
+    }
+
+    #[test]
+    fn test_internal_key_comparative() {
+        let k1 = InternalKey::restore("abc", 1, ValueType::Insertion);
+        let k2 = InternalKey::restore("abc", 1, ValueType::Insertion);
+        assert!(k1 == k2);
+
+        let k3 = InternalKey::restore("123456789", 1, ValueType::Insertion);
+        let k4 = InternalKey::restore("123", 1, ValueType::Insertion);
+        assert!(k3 > k4);
+
+        let k5 = InternalKey::restore("123", 1, ValueType::Insertion);
+        let k6 = InternalKey::restore("123", 2, ValueType::Insertion);
+        assert!(k6 < k5);
     }
 }
