@@ -1,8 +1,26 @@
 mod core;
 mod utils;
 mod logs;
+mod table;
 
 pub type DB = core::db::Database;
+
+#[repr(u8)]
+#[derive(Copy, Clone)]
+pub enum CompressionType {
+    NoCompression,
+    SnappyCompression,
+}
+
+impl From<u8> for CompressionType {
+    fn from(value: u8) -> Self {
+        if value == 1 {
+            Self::SnappyCompression
+        } else {
+            Self::NoCompression
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct Options {
@@ -16,6 +34,7 @@ pub struct Options {
     pub max_file_size: u64,
     pub reuse_logs: bool,
     pub enable_filter_policy: bool,
+    pub compression: CompressionType,
 }
 
 impl Default for Options {
@@ -31,6 +50,7 @@ impl Default for Options {
             max_file_size: 2 * 1024 * 1024,
             reuse_logs: false,
             enable_filter_policy: false,
+            compression: CompressionType::SnappyCompression,
         }
     }
 }
