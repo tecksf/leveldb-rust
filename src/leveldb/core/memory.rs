@@ -122,7 +122,7 @@ impl<T> SkipList<T> where T: Default + Ord {
     }
 }
 
-struct SkipListIterator<'a, T> {
+pub struct SkipListIterator<'a, T> {
     current: LinkedNode<T>,
     marker: PhantomData<&'a T>,
 }
@@ -161,6 +161,8 @@ impl<'a, T> IntoIterator for &'a SkipList<T> {
     }
 }
 
+pub type MemoryTableIterator<'a> = SkipListIterator<'a, LookupKey>;
+
 pub struct MemoryTable {
     table: SkipList<LookupKey>,
     usage: Cell<usize>,
@@ -187,7 +189,7 @@ impl MemoryTable {
         self.usage.get()
     }
 
-    pub fn iter(&self) -> SkipListIterator<'_, LookupKey> {
+    pub fn iter(&self) -> MemoryTableIterator {
         self.table.into_iter()
     }
 
