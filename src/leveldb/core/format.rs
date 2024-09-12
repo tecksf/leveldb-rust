@@ -11,13 +11,13 @@ pub enum ValueType {
 
 impl From<u8> for ValueType {
     fn from(n: u8) -> Self {
-        return if n == 0 {
+        if n == 0 {
             ValueType::Deletion
         } else if n == 1 {
             ValueType::Insertion
         } else {
             ValueType::Unknown
-        };
+        }
     }
 }
 
