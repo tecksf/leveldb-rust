@@ -1,10 +1,11 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::io;
 use std::rc::Rc;
 use crate::leveldb::core::format;
 use crate::leveldb::core::format::{InternalKey, UserKey};
-use crate::leveldb::logs;
+use crate::leveldb::{logs, Options};
 use crate::leveldb::utils::coding;
 
 #[derive(Clone, Eq)]
@@ -404,6 +405,80 @@ impl VersionEdit {
             }
         }
 
+        Ok(())
+    }
+}
+
+pub struct VersionSet {
+    db_name: String,
+    options: Options,
+    versions: VecDeque<Rc<Version>>,
+    current: Rc<Version>,
+    next_file_number: Cell<u64>,
+    last_sequence: Cell<u64>,
+    log_number: u64,
+    prev_log_number: u64,
+}
+
+impl VersionSet {
+    pub fn new(db_name: &str, options: Options) -> Self {
+        let mut set = VersionSet {
+            db_name: String::from(db_name),
+            options,
+            versions: VecDeque::new(),
+            current: Rc::new(Version::new()),
+            next_file_number: Cell::new(2),
+            last_sequence: Cell::new(0),
+            log_number: 0,
+            prev_log_number: 0,
+        };
+        set.versions.push_back(set.current.clone());
+        set
+    }
+
+    pub fn latest_version(&self) -> Rc<Version> {
+        self.current.clone()
+    }
+
+    pub fn num_level_files(&self, level: u8) -> usize {
+        self.current.files[level as usize].len()
+    }
+
+    pub fn get_new_file_number(&self) -> u64 {
+        let number = self.next_file_number.get();
+        self.next_file_number.set(number + 1);
+        number
+    }
+
+    pub fn get_last_sequence(&self) -> u64 {
+        self.last_sequence.get()
+    }
+
+    pub fn set_last_sequence(&self, sequence: u64) {
+        self.last_sequence.set(sequence)
+    }
+
+    pub fn get_log_number(&self) -> u64 {
+        self.log_number
+    }
+
+    pub fn get_prev_log_number(&self) -> u64 {
+        self.prev_log_number
+    }
+
+    pub fn mark_file_number_used(&self, number: u64) {
+        if self.next_file_number.get() <= number {
+            self.next_file_number.set(number + 1);
+        }
+    }
+
+    pub fn reuse_file_number(&self, number: u64) {
+        if self.next_file_number.get() == number + 1 {
+            self.next_file_number.set(number);
+        }
+    }
+
+    pub fn log_and_apply(&mut self, mut edit: VersionEdit) -> io::Result<()> {
         Ok(())
     }
 }

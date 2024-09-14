@@ -1,8 +1,10 @@
-use std::{fs, io};
+use std::{fs, io, thread, time};
 use fslock::LockFile;
-use crate::leveldb::{Options, WriteOptions};
+use crate::leveldb::{logs, Options, WriteOptions};
 use crate::leveldb::core::batch::WriteBatch;
 use crate::leveldb::core::memory::MemoryTable;
+use crate::leveldb::core::sst::build_table;
+use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::leveldb::logs::file::WritableFile;
 use crate::leveldb::logs::{filename, wal};
 
@@ -13,6 +15,7 @@ pub struct Database {
     write_ahead_logger: Option<wal::Writer<WritableFile>>,
     mutable: MemoryTable,
     immutable: Option<MemoryTable>,
+    versions: VersionSet,
 }
 
 impl Database {
@@ -27,6 +30,7 @@ impl Database {
             write_ahead_logger: None,
             mutable: MemoryTable::new(),
             immutable: None,
+            versions: VersionSet::new(path.as_ref(), options),
         };
 
         db.init()?;
@@ -46,12 +50,58 @@ impl Database {
     }
 
     pub fn write(&mut self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
-        if let Some(logger) = &mut self.write_ahead_logger {
-            logger.add_record(batch.get_payload())?;
-            if options.sync {
-                logger.sync()?;
+        let mut last_sequence = self.versions.get_last_sequence();
+        let mut write_batch = batch;
+
+        let status = self.make_room_for_write(false);
+        if status.is_ok() {
+            write_batch.set_sequence(last_sequence + 1);
+            last_sequence += write_batch.get_count() as u64;
+
+            if let Some(logger) = &mut self.write_ahead_logger {
+                logger.add_record(write_batch.get_payload())?;
+                if options.sync {
+                    logger.sync()?;
+                }
+                self.mutable.insert(&write_batch);
             }
-            self.mutable.insert(&batch);
+            self.versions.set_last_sequence(last_sequence);
+        }
+
+        Ok(())
+    }
+
+    fn make_room_for_write(&mut self, force: bool) -> io::Result<()> {
+        let mut allow_delay = !force;
+        loop {
+            if allow_delay && self.versions.num_level_files(0) >= logs::L0_SLOW_DOWN_WRITES_TRIGGER {
+                thread::sleep(time::Duration::from_millis(1));
+                allow_delay = false;
+            } else if self.mutable.memory_usage() <= self.options.write_buffer_size {
+                break;
+            } else if self.immutable.is_some() {
+                log::info!("current memory table is full, waiting...\n");
+            } else if self.versions.num_level_files(0) >= logs::L0_STOP_WRITES_TRIGGER {
+                log::info!("too many L0 files, waiting...\n");
+            } else {
+                let new_log_number = self.versions.get_new_file_number();
+                let status = WritableFile::open(filename::make_log_file_name(self.name.as_str(), new_log_number));
+                match status {
+                    Ok(file) => {
+                        self.log_file_number = new_log_number;
+                        self.write_ahead_logger = Some(wal::Writer::new(file));
+                    }
+                    Err(reason) => {
+                        log::error!("cannot create new WAL: {}", reason);
+                        self.versions.reuse_file_number(new_log_number);
+                        return Err(reason);
+                    }
+                }
+
+                let immutable = std::mem::replace(&mut self.mutable, MemoryTable::new());
+                self.immutable = Some(immutable);
+                self.maybe_schedule_compaction();
+            }
         }
         Ok(())
     }
@@ -76,4 +126,10 @@ impl Database {
 
         Ok(())
     }
+
+    fn maybe_schedule_compaction(&mut self) {
+        self.compact_memory_table();
+    }
+
+    fn compact_memory_table(&mut self) {}
 }
