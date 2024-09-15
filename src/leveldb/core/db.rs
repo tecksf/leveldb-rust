@@ -131,5 +131,44 @@ impl Database {
         self.compact_memory_table();
     }
 
-    fn compact_memory_table(&mut self) {}
+    fn compact_memory_table(&mut self) {
+        let base = self.versions.latest_version();
+        let file_number = self.versions.get_new_file_number();
+
+        if let Some(table) = &self.immutable {
+            let result = self.write_level0_table(Some(&base), file_number, table);
+            if result.is_err() {
+                return;
+            }
+
+            let (level, meta) = result.unwrap();
+            let mut edit = VersionEdit::new();
+            edit.set_prev_log_number(0);
+            edit.set_log_number(self.log_file_number);
+            edit.add_file(level, meta);
+            let status = self.versions.log_and_apply(edit);
+            if status.is_ok() {
+                self.immutable = None;
+            }
+        }
+    }
+
+    fn write_level0_table(&self, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData)> {
+        log::info!("level-0 table {}:started", file_number);
+
+        let meta = build_table(self.options, self.name.as_str(), table.iter(), file_number)?;
+
+        log::info!("level-0 table {}: {} bytes", file_number, meta.file_size);
+
+        let mut level = 0;
+        if meta.file_size > 0 {
+            let min_user_key = meta.smallest.extract_user_key();
+            let max_user_key = meta.largest.extract_user_key();
+
+            if let Some(version) = base {
+                level = version.pick_level_for_memory_table(&min_user_key, &max_user_key);
+            }
+        }
+        Ok((level, meta))
+    }
 }
