@@ -2,6 +2,7 @@ use std::{fs, io, thread, time};
 use fslock::LockFile;
 use crate::leveldb::{logs, Options, WriteOptions};
 use crate::leveldb::core::batch::WriteBatch;
+use crate::leveldb::core::format::{Comparator, InternalKey};
 use crate::leveldb::core::memory::MemoryTable;
 use crate::leveldb::core::sst::build_table;
 use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
@@ -115,6 +116,7 @@ impl Database {
         if fs::metadata(filename::make_current_file_name(self.name.as_str())).is_err() {
             if self.options.create_if_missing {
                 log::info!("Creating DB {} since it was missing", self.name);
+                Self::create_manifest(self.name.as_str(), InternalKey::name().as_str())?;
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, format!("InvalidArgument:{} does not exist(create_if_missing is false)", self.name)));
             }
@@ -125,6 +127,40 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn create_manifest(db_name: &str, comparator_name: &str) -> io::Result<()> {
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name(String::from(comparator_name));
+        edit.set_log_number(0);
+        edit.set_next_file_number(2);
+        edit.set_last_sequence(0);
+
+        let result: io::Result<()>;
+        let manifest = filename::make_manifest_file_name(db_name, 1);
+        {
+            let mut manifest_logger = wal::Writer::new(WritableFile::open(&manifest)?);
+            let record = edit.encode();
+            result = manifest_logger.add_record(record);
+        }
+
+        if result.is_ok() {
+            Self::set_current_file(db_name, 1)?;
+        } else {
+            fs::remove_file(manifest)?;
+        }
+
+        result
+    }
+
+    fn set_current_file(db_name: &str, manifest_number: u64) -> io::Result<()> {
+        let temp_path = filename::make_temp_file_name(db_name, manifest_number);
+        fs::write(&temp_path, format!("MANIFEST-{:06}", manifest_number))?;
+        let result = fs::rename(&temp_path, filename::make_current_file_name(db_name));
+        if result.is_err() {
+            fs::remove_file(&temp_path)?;
+        }
+        result
     }
 
     fn maybe_schedule_compaction(&mut self) {
