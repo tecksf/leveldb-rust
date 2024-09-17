@@ -1,11 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
-use std::io;
+use std::{fs, io};
+use std::path::Path;
 use std::rc::Rc;
 use crate::leveldb::core::format;
 use crate::leveldb::core::format::{InternalKey, UserKey};
 use crate::leveldb::{logs, Options};
+use crate::leveldb::logs::{file, filename, wal};
+use crate::leveldb::logs::filename::FileType;
 use crate::leveldb::utils::coding;
 
 #[derive(Clone, Eq)]
@@ -65,6 +68,16 @@ fn total_file_size(files: &Vec<Rc<FileMetaData>>) -> u64 {
         sum += file.file_size;
     }
     sum
+}
+
+fn max_bytes_for_level(level: usize) -> f64 {
+    let mut level = level;
+    let mut result: f64 = 10.0 * 1048576.0;
+    while level > 1 {
+        result *= 10.0;
+        level -= 1;
+    }
+    result
 }
 
 pub struct Version {
@@ -210,7 +223,7 @@ pub struct VersionEdit {
     prev_log_number: Option<u64>,
     next_file_number: Option<u64>,
     last_sequence: Option<u64>,
-    compact_pointers: Vec<(u8, Vec<u8>)>,
+    compact_pointers: Vec<(u8, InternalKey)>,
     deleted_files: BTreeSet<(u8, u64)>,
     new_files: Vec<(usize, FileMetaData)>,
 }
@@ -233,6 +246,10 @@ impl VersionEdit {
         let mut edit = VersionEdit::new();
         edit.decode_from(record.as_ref())?;
         Ok(edit)
+    }
+
+    pub fn has_updated(&self) -> bool {
+        self.deleted_files.len() > 0 || self.new_files.len() > 0
     }
 
     pub fn add_file(&mut self, level: usize, meta: FileMetaData) {
@@ -267,8 +284,8 @@ impl VersionEdit {
         self.last_sequence = Some(sequence);
     }
 
-    pub fn set_compact_pointer(&mut self, level: usize, internal_key: &[u8]) {
-        self.compact_pointers.push((level as u8, Vec::from(internal_key)));
+    pub fn set_compact_pointer(&mut self, level: usize, key: InternalKey) {
+        self.compact_pointers.push((level as u8, key));
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -304,7 +321,7 @@ impl VersionEdit {
             coding::put_variant32_into_vec(&mut result, Tag::CompactPointer as u32);
             coding::put_variant32_into_vec(&mut result, *level as u32);
             coding::put_variant32_into_vec(&mut result, internal_key.len() as u32);
-            result.extend_from_slice(internal_key.as_slice());
+            result.extend_from_slice(internal_key.as_ref());
         }
 
         for (level, file_number) in &self.deleted_files {
@@ -358,9 +375,9 @@ impl VersionEdit {
                 Tag::CompactPointer => {
                     let (level, size_width) = coding::decode_variant32(&record[offset..]);
                     offset += size_width as usize;
-                    let (internal_key, size_width) = coding::get_length_prefixed_slice(&record[offset..]);
-                    offset += internal_key.len() + size_width as usize;
-                    self.compact_pointers.push((level as u8, internal_key.to_vec()));
+                    let (key, size_width) = coding::get_length_prefixed_slice(&record[offset..]);
+                    offset += key.len() + size_width as usize;
+                    self.compact_pointers.push((level as u8, InternalKey::new(key)));
                 }
                 Tag::DeletedFile => {
                     let (level, size_width) = coding::decode_variant32(&record[offset..]);
@@ -409,6 +426,87 @@ impl VersionEdit {
     }
 }
 
+#[derive(Default)]
+struct LevelFileState {
+    deleted_files: BTreeSet<u64>,
+    added_files: BTreeSet<Rc<FileMetaData>>,
+}
+
+struct VersionBuilder<'a> {
+    version: Rc<Version>,
+    version_set: &'a mut VersionSet,
+    levels: [LevelFileState; logs::NUM_LEVELS],
+}
+
+impl<'a> VersionBuilder<'a> {
+    fn new(version_set: &'a mut VersionSet, version: Rc<Version>) -> Self {
+        Self {
+            version,
+            version_set,
+            levels: Default::default(),
+        }
+    }
+
+    fn apply(&mut self, edit: &VersionEdit) {
+        for (level, internal_key) in &edit.compact_pointers {
+            self.version_set.compact_pointers[*level as usize] = internal_key.clone();
+        }
+
+        for &(level, file_number) in &edit.deleted_files {
+            self.levels[level as usize].deleted_files.insert(file_number);
+        }
+
+        for (level, meta) in &edit.new_files {
+            let mut file_meta = meta.clone();
+            file_meta.refs = Cell::new(1);
+            file_meta.allowed_seeks.set((file_meta.file_size / 16384) as i32);
+            if file_meta.allowed_seeks.get() < 100 {
+                file_meta.allowed_seeks.set(100);
+            }
+
+            self.levels[*level].deleted_files.remove(&file_meta.number);
+            self.levels[*level].added_files.insert(Rc::new(file_meta));
+        }
+    }
+
+    fn generate_new_version(&self) -> Version {
+        let mut new_version = Version::new();
+
+        for (level, base_file_metas) in self.version.files.iter().enumerate() {
+            let ref added_file_metas = self.levels[level].added_files;
+            new_version.files[level].reserve(base_file_metas.len() + added_file_metas.len());
+
+            // base_file_metas are in ascending order,
+            // since version.files are from VersionEdit.levels.added_files which is ordered in each generation
+            let mut start: usize = 0;
+            for added_file in added_file_metas {
+                let base_file = &base_file_metas[start..];
+                let index = base_file.partition_point(|file| file < added_file);
+                for base in &base_file[..index] {
+                    self.maybe_add_file(&mut new_version, level, base.clone())
+                }
+                start += index;
+                self.maybe_add_file(&mut new_version, level, added_file.clone());
+            }
+            (&base_file_metas[start..]).iter().for_each(|file| self.maybe_add_file(&mut new_version, level, file.clone()));
+        }
+
+        new_version
+    }
+
+    fn maybe_add_file(&self, version: &mut Version, level: usize, meta: Rc<FileMetaData>) {
+        if self.levels[level].deleted_files.contains(&meta.number) {
+            log::debug!("{} file is deleted: do nothing", meta.number);
+        } else {
+            let ref mut file_metas = version.files[level];
+            if level > 0 && !file_metas.is_empty() {}
+
+            meta.refs.set(meta.refs.get() + 1);
+            file_metas.push(meta);
+        }
+    }
+}
+
 pub struct VersionSet {
     db_name: String,
     options: Options,
@@ -418,6 +516,9 @@ pub struct VersionSet {
     last_sequence: Cell<u64>,
     log_number: u64,
     prev_log_number: u64,
+    manifest_file_number: u64,
+    manifest_logger: Option<wal::Writer<file::WritableFile>>,
+    compact_pointers: [InternalKey; logs::NUM_LEVELS],
 }
 
 impl VersionSet {
@@ -431,6 +532,9 @@ impl VersionSet {
             last_sequence: Cell::new(0),
             log_number: 0,
             prev_log_number: 0,
+            manifest_file_number: 0,
+            manifest_logger: None,
+            compact_pointers: Default::default(),
         };
         set.versions.push_back(set.current.clone());
         set
@@ -481,13 +585,177 @@ impl VersionSet {
     pub fn log_and_apply(&mut self, mut edit: VersionEdit) -> io::Result<()> {
         Ok(())
     }
+
+    pub fn add_live_files(&self) -> BTreeSet<u64> {
+        let mut live = BTreeSet::<u64>::new();
+        for version in &self.versions {
+            for level in 0..logs::NUM_LEVELS {
+                let files = &version.files[level];
+                for f in files {
+                    live.insert(f.number);
+                }
+            }
+        }
+        live
+    }
+
+    pub fn recover(&mut self) -> io::Result<()> {
+        let manifest_name = fs::read_to_string(filename::make_current_file_name(&self.db_name))?;
+        let file = file::ReadableFile::open(Path::new(&self.db_name).join(manifest_name.as_str()))?;
+
+        let mut next_file_number: Option<u64> = None;
+        let mut last_sequence: Option<u64> = None;
+        let mut log_number: Option<u64> = None;
+        let mut prev_log_numer: Option<u64> = None;
+
+        let mut builder = VersionBuilder::new(self, self.latest_version());
+
+        let reader = wal::Reader::new(file);
+        while let Some(record) = reader.read_record() {
+            let edit = VersionEdit::make_from(record).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidData, err)
+            })?;
+            builder.apply(&edit);
+
+            if edit.log_number.is_some() {
+                log_number = edit.log_number;
+            }
+
+            if edit.prev_log_number.is_some() {
+                prev_log_numer = edit.prev_log_number;
+            }
+
+            if edit.next_file_number.is_some() {
+                next_file_number = edit.next_file_number;
+            }
+
+            if edit.last_sequence.is_some() {
+                last_sequence = edit.last_sequence;
+            }
+        }
+
+        if next_file_number.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no meta next file entry in descriptor"));
+        }
+
+        if log_number.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no meta log number entry in descriptor"));
+        }
+
+        if last_sequence.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no meta last sequence entry in descriptor"));
+        }
+
+        let mut version = builder.generate_new_version();
+        self.finalize(&mut version);
+        self.append_version(version);
+
+        self.manifest_file_number = next_file_number.unwrap_or(0);
+        self.next_file_number.set(self.manifest_file_number + 1);
+        self.last_sequence.set(last_sequence.unwrap_or(0));
+        self.log_number = log_number.unwrap_or(0);
+        self.prev_log_number = prev_log_numer.unwrap_or(0);
+
+        self.mark_file_number_used(self.prev_log_number);
+        self.mark_file_number_used(self.log_number);
+
+        let mut need_new_manifest = true;
+        if let Some(number) = self.reuse_manifest(manifest_name.as_str()) {
+            log::info!("Reuse Manifest {}", manifest_name);
+            self.manifest_file_number = number;
+            need_new_manifest = false;
+        }
+
+        let manifest_path = filename::make_manifest_file_name(self.db_name.as_str(), self.manifest_file_number);
+        let manifest_logger = match file::WritableFile::open(&manifest_path) {
+            Ok(file) => wal::Writer::new(file),
+            _ => return Err(io::Error::new(io::ErrorKind::NotFound, format!("cannot open manifest {:?}", manifest_path)))
+        };
+        self.manifest_logger = Some(manifest_logger);
+
+        if need_new_manifest {
+            self.write_snapshot()?;
+            if file::set_current_file(self.db_name.as_str(), self.manifest_file_number).is_err() {
+                return Err(io::Error::new(io::ErrorKind::Other, "cannot write current file"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn append_version(&mut self, version: Version) {
+        let latest_version = Rc::new(version);
+        self.versions.push_back(latest_version.clone());
+        self.current = latest_version;
+    }
+
+    fn reuse_manifest(&self, manifest_name: &str) -> Option<u64> {
+        if !self.options.reuse_logs {
+            return None;
+        }
+
+        let (file_type, number) = filename::parse_file_name(manifest_name)?;
+        let manifest_path = Path::new(&self.db_name).join(manifest_name);
+        let manifest_file = fs::metadata(&manifest_path);
+        if file_type != FileType::ManifestFile || manifest_file.is_err() || manifest_file.unwrap().len() >= self.options.max_file_size {
+            return None;
+        }
+
+        Some(number)
+    }
+
+    fn finalize(&self, version: &mut Version) {
+        let mut best_level: usize = 0;
+        let mut best_score: f64 = -1.0;
+
+        for level in 0..logs::NUM_LEVELS {
+            let score: f64 = if level == 0 {
+                version.files[level].len() as f64 / logs::L0_COMPACTION_TRIGGER as f64
+            } else {
+                total_file_size(&version.files[level]) as f64 / max_bytes_for_level(level)
+            };
+
+            if score > best_score {
+                best_score = score;
+                best_level = level;
+            }
+        }
+
+        version.compaction_level = best_level;
+        version.compaction_score = best_score;
+    }
+
+    fn write_snapshot(&mut self) -> io::Result<()> {
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name(String::from(""));
+
+        for level in 0..logs::NUM_LEVELS {
+            let internal_key = &self.compact_pointers[level];
+            edit.set_compact_pointer(level, internal_key.clone());
+        }
+
+        for level in 0..logs::NUM_LEVELS {
+            let files = &self.current.files[level];
+            for file in files {
+                edit.add_file(level, file.as_ref().clone());
+            }
+        }
+
+        let record = edit.encode();
+        if let Some(logger) = &mut self.manifest_logger {
+            logger.add_record(record)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
     use crate::leveldb::core::format::{InternalKey, UserKey, ValueType};
-    use super::{FileMetaData, Version, VersionEdit};
+    use crate::leveldb::Options;
+    use super::{FileMetaData, Version, VersionBuilder, VersionEdit, VersionSet};
 
     fn create_file_meta<T: AsRef<[u8]>>(number: u64, key1: T, key2: T) -> FileMetaData {
         let mut meta = FileMetaData::new();
@@ -498,7 +766,7 @@ mod tests {
         meta
     }
 
-    fn create_version_edit() -> VersionEdit {
+    fn create_version_edit1() -> VersionEdit {
         let mut edit = VersionEdit::new();
         edit.set_comparator_name(String::from("InternalKeyComparator"));
         edit.set_last_sequence(123);
@@ -523,6 +791,44 @@ mod tests {
         edit.remove_file(3, 99);
         edit.remove_file(4, 98);
         edit.remove_file(5, 97);
+        edit
+    }
+
+    fn create_version_edit2() -> VersionEdit {
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name(String::from("InternalKeyComparator"));
+        edit.set_last_sequence(130);
+        edit.set_prev_log_number(100);
+        edit.set_log_number(101);
+        edit.set_next_file_number(102);
+
+        let mut f3 = FileMetaData::new();
+        f3.number = 3;
+        f3.file_size = 10 << 8;
+        f3.smallest = InternalKey::restore("abc", 362, ValueType::Insertion);
+        f3.largest = InternalKey::restore("adz", 363, ValueType::Insertion);
+
+        edit.add_file(1, f3);
+        edit.remove_file(0, 1);
+        edit.remove_file(1, 2);
+        edit
+    }
+
+    fn create_version_edit3() -> VersionEdit {
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name(String::from("InternalKeyComparator"));
+        edit.set_last_sequence(140);
+        edit.set_prev_log_number(101);
+        edit.set_log_number(102);
+        edit.set_next_file_number(103);
+
+        let mut f4 = FileMetaData::new();
+        f4.number = 4;
+        f4.file_size = 10 << 8;
+        f4.smallest = InternalKey::restore("fgh", 320, ValueType::Insertion);
+        f4.largest = InternalKey::restore("jkl", 321, ValueType::Insertion);
+
+        edit.add_file(0, f4);
         edit
     }
 
@@ -571,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_version_edit_encoded() {
-        let edit1 = create_version_edit();
+        let edit1 = create_version_edit1();
         let result = edit1.encode();
         let new_edit = VersionEdit::make_from(result);
         assert!(new_edit.is_ok());
@@ -584,5 +890,23 @@ mod tests {
         assert_eq!(edit2.next_file_number, Some(101));
         assert_eq!(edit2.new_files.len(), 2);
         assert_eq!(edit2.deleted_files.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_multi_version_edit() {
+        let mut version_set = VersionSet::new("test", Options::default());
+        let base_version = Rc::new(Version::new());
+        let mut builder = VersionBuilder::new(&mut version_set, base_version);
+
+        let edit1 = create_version_edit1();
+        let edit2 = create_version_edit2();
+        let edit3 = create_version_edit3();
+        builder.apply(&edit1);
+        builder.apply(&edit2);
+        builder.apply(&edit3);
+
+        let new_version = builder.generate_new_version();
+        assert_eq!(new_version.files[0].len(), 1);
+        assert_eq!(new_version.files[1].len(), 1);
     }
 }

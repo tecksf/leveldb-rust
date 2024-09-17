@@ -1,4 +1,5 @@
 use std::{fs, io, thread, time};
+use std::collections::BTreeSet;
 use fslock::LockFile;
 use crate::leveldb::{logs, Options, WriteOptions};
 use crate::leveldb::core::batch::WriteBatch;
@@ -7,7 +8,7 @@ use crate::leveldb::core::memory::MemoryTable;
 use crate::leveldb::core::sst::build_table;
 use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::leveldb::logs::file::WritableFile;
-use crate::leveldb::logs::{filename, wal};
+use crate::leveldb::logs::{file, filename, wal};
 
 pub struct Database {
     name: String,
@@ -35,10 +36,24 @@ impl Database {
         };
 
         db.init()?;
+        let mut edit = db.recover()?;
+
+        // has log number indicate that reuse log file
+        db.log_file_number = if let Some(number) = edit.get_log_number() {
+            number
+        } else {
+            db.versions.get_new_file_number()
+        };
 
         if db.write_ahead_logger.is_none() {
             let file = WritableFile::open(filename::make_log_file_name(path.as_ref(), db.log_file_number))?;
             db.write_ahead_logger = Some(wal::Writer::new(file));
+        }
+
+        if edit.has_updated() || edit.get_log_number().is_none() {
+            edit.set_prev_log_number(0);
+            edit.set_log_number(db.log_file_number);
+            db.versions.log_and_apply(edit)?;
         }
 
         Ok(db)
@@ -145,7 +160,7 @@ impl Database {
         }
 
         if result.is_ok() {
-            Self::set_current_file(db_name, 1)?;
+            file::set_current_file(db_name, 1)?;
         } else {
             fs::remove_file(manifest)?;
         }
@@ -153,14 +168,90 @@ impl Database {
         result
     }
 
-    fn set_current_file(db_name: &str, manifest_number: u64) -> io::Result<()> {
-        let temp_path = filename::make_temp_file_name(db_name, manifest_number);
-        fs::write(&temp_path, format!("MANIFEST-{:06}", manifest_number))?;
-        let result = fs::rename(&temp_path, filename::make_current_file_name(db_name));
-        if result.is_err() {
-            fs::remove_file(&temp_path)?;
+    fn recover(&mut self) -> io::Result<VersionEdit> {
+        self.versions.recover()?;
+        let min_log = self.versions.get_log_number();
+        let prev_log = self.versions.get_prev_log_number();
+
+        let mut expected_files = self.versions.add_live_files();
+        let mut log_numbers = Vec::<u64>::new();
+        let filenames = file::get_all_filenames(self.name.as_str());
+        for filename in filenames {
+            if let Some((file_type, number)) = filename::parse_file_name(filename.to_str().unwrap_or("unknown")) {
+                expected_files.remove(&number);
+                match file_type {
+                    filename::FileType::LogFile if number >= min_log || number == prev_log => {
+                        log_numbers.push(number);
+                    }
+                    _ => {}
+                }
+            }
         }
-        result
+
+        if !expected_files.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} missing files; e.g.", expected_files.len())));
+        }
+
+        let mut max_sequence: u64 = 0;
+        let mut edit = VersionEdit::new();
+        log_numbers.sort();
+        for (index, &number) in log_numbers.iter().enumerate() {
+            let sequence = self.recover_log_file(number, &mut edit, index == (log_numbers.len() - 1))?;
+            if sequence > max_sequence {
+                max_sequence = sequence;
+            }
+            self.versions.mark_file_number_used(number);
+        }
+
+        if self.versions.get_last_sequence() < max_sequence {
+            self.versions.set_last_sequence(max_sequence);
+        }
+
+        Ok(edit)
+    }
+
+    fn recover_log_file(&mut self, log_number: u64, edit: &mut VersionEdit, last_file: bool) -> io::Result<u64> {
+        let log_file_name = filename::make_log_file_name(self.name.as_ref(), log_number);
+        let reader = wal::Reader::new(file::ReadableFile::open(&log_file_name)?);
+        let mut max_sequence: u64 = 0;
+        let mut compactions = 0;
+        let mut new_table = MemoryTable::new();
+
+        while let Some(record) = reader.read_record() {
+            if record.len() < 12 {
+                log::error!("log record too small");
+                continue;
+            }
+            let batch = WriteBatch::make_from(record);
+            new_table.insert(&batch);
+
+            let last_sequence = batch.get_sequence() + (batch.get_count() - 1) as u64;
+            if last_sequence > max_sequence {
+                max_sequence = last_sequence;
+            }
+
+            if new_table.memory_usage() > self.options.write_buffer_size {
+                compactions += 1;
+                let new_number = self.versions.get_new_file_number();
+                let (level, file_meta) = self.write_level0_table(None, new_number, &new_table)?;
+                edit.add_file(level, file_meta);
+
+                new_table = MemoryTable::new();
+            }
+        }
+
+        if self.options.reuse_logs && last_file && compactions == 0 {
+            edit.set_log_number(log_number);
+            new_table = std::mem::replace(&mut self.mutable, new_table);
+        }
+
+        if new_table.memory_usage() > 0 {
+            let new_number = self.versions.get_new_file_number();
+            let (level, file_meta) = self.write_level0_table(None, new_number, &new_table)?;
+            edit.add_file(level, file_meta);
+        }
+
+        Ok(max_sequence)
     }
 
     fn maybe_schedule_compaction(&mut self) {

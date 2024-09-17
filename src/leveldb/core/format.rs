@@ -156,7 +156,7 @@ impl PartialOrd for InternalKey {
             let n2 = other.extract_sequence();
             return Some(n2.cmp(&n1));
         }
-        return Some(rc);
+        Some(rc)
     }
 }
 

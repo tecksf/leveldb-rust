@@ -26,9 +26,7 @@ type LinkedNode<T> = Link<Node<T>>;
 impl<T> Clone for LinkedNode<T> {
     fn clone(&self) -> Self {
         match self {
-            Link::Ptr(p) => {
-                return Link::Ptr(p.clone());
-            }
+            Link::Ptr(p) => Link::Ptr(p.clone()),
             _ => Link::Nil
         }
     }

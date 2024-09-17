@@ -1,7 +1,8 @@
 use std::{fs, io};
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
+use crate::leveldb::logs::filename;
 
 pub trait WriterView {
     fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize>;
@@ -15,6 +16,24 @@ pub trait ReaderView {
 
 pub trait RandomReaderView {
     fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<()>;
+}
+
+pub fn get_all_filenames(dir: &str) -> Vec<OsString> {
+    if let Ok(paths) = fs::read_dir(dir) {
+        paths.map(|path| { path.unwrap().file_name() }).collect::<Vec<_>>()
+    } else {
+        vec![]
+    }
+}
+
+pub fn set_current_file(db_name: &str, manifest_number: u64) -> io::Result<()> {
+    let temp_path = filename::make_temp_file_name(db_name, manifest_number);
+    fs::write(&temp_path, format!("MANIFEST-{:06}", manifest_number))?;
+    let result = fs::rename(&temp_path, filename::make_current_file_name(db_name));
+    if result.is_err() {
+        fs::remove_file(&temp_path)?;
+    }
+    result
 }
 
 pub struct WritableFile {
@@ -61,7 +80,7 @@ impl ReadableFile {
 impl ReaderView for ReadableFile {
     fn read(&self, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
         let buf = &mut buffer[..count];
-        return self.file_handle.borrow_mut().read(buf);
+        self.file_handle.borrow_mut().read(buf)
     }
 }
 

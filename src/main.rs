@@ -3,7 +3,9 @@ use crate::leveldb::{Options, WriteOptions};
 mod leveldb;
 
 fn main() {
-    let options = Options::default();
+    let mut options = Options::default();
+    options.create_if_missing = true;
+
     let mut db = match leveldb::DB::open("/tmp/leveldb", options) {
         Ok(db) => db,
         Err(reason) => {
