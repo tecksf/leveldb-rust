@@ -1,5 +1,7 @@
 use std::{fs, io, thread, time};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::Path;
 use fslock::LockFile;
 use crate::leveldb::{logs, Options, WriteOptions};
 use crate::leveldb::core::batch::WriteBatch;
@@ -9,6 +11,7 @@ use crate::leveldb::core::sst::build_table;
 use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::leveldb::logs::file::WritableFile;
 use crate::leveldb::logs::{file, filename, wal};
+use crate::leveldb::logs::filename::FileType;
 
 pub struct Database {
     name: String,
@@ -55,6 +58,8 @@ impl Database {
             edit.set_log_number(db.log_file_number);
             db.versions.log_and_apply(edit)?;
         }
+
+        db.remove_obsolete_files();
 
         Ok(db)
     }
@@ -276,6 +281,7 @@ impl Database {
             let status = self.versions.log_and_apply(edit);
             if status.is_ok() {
                 self.immutable = None;
+                self.remove_obsolete_files();
             }
         }
     }
@@ -297,5 +303,30 @@ impl Database {
             }
         }
         Ok((level, meta))
+    }
+
+    fn remove_obsolete_files(&self) {
+        let live_files = self.versions.add_live_files();
+        let mut files_to_delete = Vec::<OsString>::new();
+        let filenames = file::get_all_filenames(self.name.as_str());
+        for filename in filenames {
+            if let Some((file_type, number)) = filename::parse_file_name(filename.to_str().unwrap_or("unknown")) {
+                let keep = match file_type {
+                    FileType::LogFile => number >= self.versions.get_log_number() || number == self.versions.get_prev_log_number(),
+                    FileType::ManifestFile => number >= self.versions.get_manifest_file_number(),
+                    FileType::TableFile | FileType::TempFile => live_files.contains(&number),
+                    _ => true,
+                };
+
+                if !keep {
+                    files_to_delete.push(filename);
+                    log::info!("Delete type={:?}, number={}", file_type, number);
+                }
+            }
+        }
+
+        for filename in files_to_delete {
+            fs::remove_file(Path::new(&self.name).join(filename)).unwrap();
+        }
     }
 }

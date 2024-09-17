@@ -570,6 +570,10 @@ impl VersionSet {
         self.prev_log_number
     }
 
+    pub fn get_manifest_file_number(&self) -> u64 {
+        self.manifest_file_number
+    }
+
     pub fn mark_file_number_used(&self, number: u64) {
         if self.next_file_number.get() <= number {
             self.next_file_number.set(number + 1);
