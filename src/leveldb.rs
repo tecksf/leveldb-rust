@@ -22,6 +22,12 @@ impl From<u8> for CompressionType {
     }
 }
 
+pub trait FilterPolicy {
+    fn name(&self) -> String;
+    fn key_may_match(&self, filter: &[u8], key: &[u8]) -> bool;
+    fn create_filter(&self, keys: Vec<&[u8]>) -> Vec<u8>;
+}
+
 #[derive(Copy, Clone)]
 pub struct Options {
     pub create_if_missing: bool,

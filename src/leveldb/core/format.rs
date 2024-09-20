@@ -57,6 +57,12 @@ impl<'a> AsRef<[u8]> for UserKey<'a> {
     }
 }
 
+impl<'a> Into<&'a [u8]> for UserKey<'a> {
+    fn into(self) -> &'a [u8] {
+        self.payload
+    }
+}
+
 impl Comparator for UserKey<'_> {
     fn name() -> String {
         String::from("leveldb.BytewiseComparator")
@@ -109,6 +115,13 @@ impl InternalKey {
         }
 
         Self { payload }
+    }
+
+    pub fn fetch_user_key(key: &[u8]) -> UserKey {
+        if key.len() < Self::MIN_LEN {
+            return UserKey::new(key);
+        }
+        UserKey::new(&key[..key.len() - InternalKey::MIN_LEN])
     }
 
     pub fn len(&self) -> usize {
