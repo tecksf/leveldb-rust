@@ -1,3 +1,4 @@
+use crate::leveldb::core::format::InternalKey;
 use crate::leveldb::FilterPolicy;
 use crate::leveldb::utils::common::hash;
 
@@ -83,6 +84,38 @@ impl FilterPolicy for BloomFilterPolicy {
         }
 
         ans
+    }
+}
+
+pub struct InternalFilterPolicy<P> {
+    policy: P,
+}
+
+impl<P> InternalFilterPolicy<P> {
+    pub fn new(policy: P) -> Self {
+        Self {
+            policy
+        }
+    }
+}
+
+impl<P: FilterPolicy> FilterPolicy for InternalFilterPolicy<P> {
+    fn name(&self) -> String {
+        self.policy.name()
+    }
+
+    fn key_may_match(&self, filter: &[u8], internal_key: &[u8]) -> bool {
+        let user_key = InternalKey::fetch_user_key(internal_key);
+        self.policy.key_may_match(filter, user_key.as_ref())
+    }
+
+    fn create_filter(&self, internal_keys: Vec<&[u8]>) -> Vec<u8> {
+        let mut user_keys = Vec::<&[u8]>::with_capacity(internal_keys.len());
+        for key in internal_keys {
+            let user_key = InternalKey::fetch_user_key(key);
+            user_keys.push(user_key.into());
+        }
+        self.policy.create_filter(user_keys)
     }
 }
 
