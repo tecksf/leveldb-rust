@@ -1,13 +1,15 @@
 use std::io;
 use crate::leveldb::logs::file::WriterView;
-use crate::leveldb::{CompressionType, Options, table};
+use crate::leveldb::{CompressionType, Options, table, FilterPolicy};
 use crate::leveldb::core::format::{Comparator, InternalKey};
 use crate::leveldb::table::block::{BlockHandle, Footer};
+use crate::leveldb::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::leveldb::utils::coding;
 
 struct BlockChunk {
     data_block: BlockBuilder,
     index_block: BlockBuilder,
+    filter_block: Option<FilterBlockBuilder>,
 }
 
 pub struct TableBuilder<T: WriterView> {
@@ -27,7 +29,13 @@ impl<T: WriterView> TableBuilder<T> {
         let mut block_trunk = BlockChunk {
             data_block: BlockBuilder::new(options.block_restart_interval),
             index_block: BlockBuilder::new(1),
+            filter_block: None,
         };
+
+        if options.enable_filter_policy {
+            let filter = InternalFilterPolicy::new(BloomFilterPolicy::new(10));
+            block_trunk.filter_block = Some(FilterBlockBuilder::new(Box::new(filter)));
+        }
 
         Self {
             file,
@@ -55,6 +63,10 @@ impl<T: WriterView> TableBuilder<T> {
             self.pending_index_handle = None;
         }
 
+        if let Some(filter_block) = &mut self.block_trunk.filter_block {
+            filter_block.add_key(internal_key.as_ref());
+        }
+
         self.block_trunk.data_block.add(internal_key.as_ref(), value.as_ref());
         self.last_key.assign(internal_key);
         self.num_entries += 1;
@@ -71,6 +83,23 @@ impl<T: WriterView> TableBuilder<T> {
 
         self.flush();
         self.closed = true;
+
+        // filter(meta) block
+        if self.block_trunk.filter_block.is_some() {
+            let mut filter_block = std::mem::replace(&mut self.block_trunk.filter_block, None).unwrap();
+            let filter_block_handle = self.write_raw_block(filter_block.finish(), CompressionType::NoCompression);
+
+            // meta index block
+            if self.is_ok() {
+                let mut meta_index_block = BlockBuilder::new(self.options.block_restart_interval);
+                let key = format!("filter.{}", filter_block.get_policy_name());
+                let value = filter_block_handle.encode();
+                meta_index_block.add(key.as_bytes(), value.as_slice());
+
+                let block_contents = Vec::from(meta_index_block.finish());
+                meta_index_block_handle = self.write_block_contents(block_contents);
+            }
+        }
 
         // index block
         if self.is_ok() {
@@ -130,6 +159,10 @@ impl<T: WriterView> TableBuilder<T> {
             self.status = self.file.flush();
         } else {
             self.pending_index_handle = None;
+        }
+
+        if let Some(filter_block) = &mut self.block_trunk.filter_block {
+            filter_block.start_block(self.offset);
         }
     }
 
@@ -240,6 +273,78 @@ impl BlockBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
+    }
+}
+
+pub struct FilterBlockBuilder {
+    keys: Vec<u8>,
+    key_offsets: Vec<usize>,
+    bloom_filter_results: Vec<u8>,
+    filter_offsets: Vec<usize>,
+    policy: Box<dyn FilterPolicy>,
+}
+
+impl FilterBlockBuilder {
+    pub fn new(policy: Box<dyn FilterPolicy>) -> Self {
+        Self {
+            keys: Vec::with_capacity(128),
+            key_offsets: Vec::with_capacity(16),
+            bloom_filter_results: Vec::with_capacity(128),
+            filter_offsets: Vec::with_capacity(16),
+            policy,
+        }
+    }
+
+    pub fn start_block(&mut self, block_offset: usize) {
+        // block_offset represents data block size, one filter index per 2KB block
+        let filter_index_count = block_offset / table::FILTER_BASE;
+        while filter_index_count > self.filter_offsets.len() {
+            self.generate_filter();
+        }
+    }
+
+    pub fn add_key(&mut self, key: &[u8]) {
+        self.key_offsets.push(self.keys.len());
+        self.keys.extend_from_slice(key);
+    }
+
+    pub fn finish(&mut self) -> &[u8] {
+        if !self.key_offsets.is_empty() {
+            self.generate_filter();
+        }
+
+        let filter_offset_in_block = self.bloom_filter_results.len() as u32;
+        self.filter_offsets.iter().for_each(|&offset| coding::put_fixed32_into_vec(&mut self.bloom_filter_results, offset as u32));
+        coding::put_fixed32_into_vec(&mut self.bloom_filter_results, filter_offset_in_block);
+        self.bloom_filter_results.push(table::FILTER_BASE_LOG as u8);
+
+        &self.bloom_filter_results[..]
+    }
+
+    pub fn get_policy_name(&self) -> String {
+        self.policy.name()
+    }
+
+    fn generate_filter(&mut self) {
+        let num_keys = self.key_offsets.len();
+        if num_keys == 0 {
+            self.filter_offsets.push(self.bloom_filter_results.len());
+            return;
+        }
+
+        self.key_offsets.push(self.keys.len());
+        let mut tmp_keys: Vec<&[u8]> = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let (begin, end) = (self.key_offsets[i], self.key_offsets[i + 1]);
+            tmp_keys.push(&self.keys[begin..end]);
+        }
+
+        let result = self.policy.create_filter(tmp_keys);
+        self.filter_offsets.push(self.bloom_filter_results.len());
+        self.bloom_filter_results.extend(result);
+
+        self.keys.clear();
+        self.key_offsets.clear();
     }
 }
 
@@ -364,7 +469,7 @@ mod tests {
         let file = WritableMemory::new(&mut result);
         let mut builder = TableBuilder::new(options, file);
         for (key, value) in data {
-            let internal_key = InternalKey::restore(key,8, ValueType::Insertion);
+            let internal_key = InternalKey::restore(key, 8, ValueType::Insertion);
             builder.add(&internal_key, value);
         }
         builder.finish();
