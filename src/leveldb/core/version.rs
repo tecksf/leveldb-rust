@@ -587,6 +587,38 @@ impl VersionSet {
     }
 
     pub fn log_and_apply(&mut self, mut edit: VersionEdit) -> io::Result<()> {
+        if edit.log_number.is_none() {
+            edit.set_log_number(self.log_number);
+        }
+
+        if edit.prev_log_number.is_none() {
+            edit.set_prev_log_number(self.prev_log_number);
+        }
+
+        edit.set_next_file_number(self.next_file_number.get());
+        edit.set_last_sequence(self.last_sequence.get());
+
+        // let handle_compact_pointers = |level: usize, internal_key: &Vec<u8>| {
+        //     self.compact_pointers[level] = internal_key.clone();
+        // };
+        let mut builder = VersionBuilder::new(self, self.latest_version());
+        builder.apply(&edit);
+        let mut version = builder.generate_new_version();
+        self.finalize(&mut version);
+
+        if self.manifest_logger.is_none() {
+            let file = file::WritableFile::open(filename::make_manifest_file_name(self.db_name.as_str(), self.manifest_file_number))?;
+            self.manifest_logger = Some(wal::Writer::new(file));
+        }
+
+        let record = edit.encode();
+        if let Some(logger) = &mut self.manifest_logger {
+            logger.add_record(record)?;
+            self.append_version(version);
+            self.log_number = edit.log_number.unwrap();
+            self.prev_log_number = edit.prev_log_number.unwrap();
+        }
+
         Ok(())
     }
 
