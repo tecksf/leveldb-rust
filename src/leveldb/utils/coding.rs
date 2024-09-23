@@ -162,7 +162,7 @@ pub fn decode_variant32(src: &[u8]) -> (u32, u8) {
         index += 1;
         shift += 7;
     }
-    return (0, 0);
+    (0, 0)
 }
 
 pub fn decode_variant64(src: &[u8]) -> (u64, u8) {
@@ -179,7 +179,7 @@ pub fn decode_variant64(src: &[u8]) -> (u64, u8) {
         index += 1;
         shift += 7;
     }
-    return (0, 0);
+    (0, 0)
 }
 
 pub fn get_variant_length(val: u64) -> usize {

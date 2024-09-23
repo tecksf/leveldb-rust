@@ -22,13 +22,13 @@ enum AdditionRecordType {
 
 impl From<u8> for RecordType {
     fn from(num: u8) -> Self {
-        return match num {
+        match num {
             0 => RecordType::Zero,
             1 => RecordType::Full,
             2 => RecordType::First,
             3 => RecordType::Middle,
             _ => RecordType::Last,
-        };
+        }
     }
 }
 
@@ -243,7 +243,7 @@ impl<T: ReaderView> Reader<T> {
         let record_interval = Interval::new(begin + RECORD_HEADER_SIZE, begin + record_length + RECORD_HEADER_SIZE);
         self.buffer_room.skip(RECORD_HEADER_SIZE + record_length);
 
-        return (AdditionRecordType::RecordType(record_type), record_interval);
+        (AdditionRecordType::RecordType(record_type), record_interval)
     }
 }
 

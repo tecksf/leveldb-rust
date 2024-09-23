@@ -50,7 +50,7 @@ pub fn make_lock_file_name(db_path: &str) -> OsString {
 }
 
 pub fn parse_file_name(filename: &str) -> Option<(FileType, u64)> {
-    return if filename == "CURRENT" {
+    if filename == "CURRENT" {
         Some((FileType::CurrentFile, 0))
     } else if filename == "LOCK" {
         Some((FileType::LockFile, 0))
@@ -76,5 +76,5 @@ pub fn parse_file_name(filename: &str) -> Option<(FileType, u64)> {
         } else {
             None
         }
-    };
+    }
 }

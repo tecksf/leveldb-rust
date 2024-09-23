@@ -25,7 +25,7 @@ impl BlockHandle {
             size: size as usize,
         };
 
-        return Ok(handle);
+        Ok(handle)
     }
 
     pub fn encode(&self) -> Vec<u8> {

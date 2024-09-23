@@ -1,5 +1,4 @@
 use std::{fs, io, thread, time};
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::Path;
 use fslock::LockFile;
@@ -185,7 +184,7 @@ impl Database {
             if let Some((file_type, number)) = filename::parse_file_name(filename.to_str().unwrap_or("unknown")) {
                 expected_files.remove(&number);
                 match file_type {
-                    filename::FileType::LogFile if number >= min_log || number == prev_log => {
+                    FileType::LogFile if number >= min_log || number == prev_log => {
                         log_numbers.push(number);
                     }
                     _ => {}
