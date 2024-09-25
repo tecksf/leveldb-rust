@@ -1,3 +1,5 @@
+use std::io;
+use std::rc::Rc;
 use crate::leveldb::table;
 use crate::leveldb::utils::coding;
 
@@ -34,6 +36,30 @@ impl BlockHandle {
         coding::put_variant64_into_vec(&mut result, self.size as u64);
 
         result
+    }
+}
+
+pub struct Block {
+    data: Rc<Vec<u8>>,
+    restart_offset: usize,
+}
+
+impl Block {
+    pub fn new(data: Vec<u8>) -> io::Result<Self> {
+        if data.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "block size is less than 4 bytes"));
+        }
+        let mut block = Block { data: Rc::new(data), restart_offset: 0 };
+        block.restart_offset = block.data.len() - ((1 + block.num_restarts()) * 4) as usize;
+        Ok(block)
+    }
+
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn num_restarts(&self) -> u32 {
+        coding::decode_fixed32(&self.data[self.data.len() - 4..])
     }
 }
 
