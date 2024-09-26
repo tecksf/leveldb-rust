@@ -146,3 +146,23 @@ impl Footer {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockHandle, Footer};
+
+    #[test]
+    fn test_footer_block() {
+        let meta_index_block_handle = BlockHandle { offset: 1234, size: 12800 };
+        let index_block_handle = BlockHandle { offset: 2048, size: 65535 };
+        let footer = Footer { meta_index_block_handle, index_block_handle };
+        let ans = footer.encode();
+
+        let result = Footer::decode_from(&ans);
+        assert!(result.is_ok());
+
+        let f = result.unwrap();
+        assert_eq!(f.meta_index_block_handle, meta_index_block_handle);
+        assert_eq!(f.index_block_handle, index_block_handle);
+    }
+}
