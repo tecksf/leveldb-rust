@@ -1,6 +1,6 @@
 use std::io;
 use std::rc::Rc;
-use crate::leveldb::table;
+use crate::leveldb::{table, FilterPolicy};
 use crate::leveldb::utils::coding;
 
 #[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
@@ -60,6 +60,47 @@ impl Block {
 
     pub fn num_restarts(&self) -> u32 {
         coding::decode_fixed32(&self.data[self.data.len() - 4..])
+    }
+}
+
+pub struct Filter {
+    data: Vec<u8>,
+    policy: Box<dyn FilterPolicy>,
+    filter_offset_start: usize,
+    filter_num: usize,
+    base_log: u8,
+}
+
+impl Filter {
+    pub fn new(data: Vec<u8>, policy: Box<dyn FilterPolicy>) -> io::Result<Self> {
+        let length = data.len();
+        if length < 5 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "block size is less than 5 bytes"));
+        }
+
+        let base_log = data[length - 1];
+        let filter_offset_start = coding::decode_fixed32(&data[length - 5..]) as usize;
+        if filter_offset_start > length - 5 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "block structure is unbalanced"));
+        }
+        let filter_num = (length - 5 - filter_offset_start) / 4;
+
+        Ok(Self { data, policy, filter_offset_start, filter_num, base_log })
+    }
+
+    pub fn key_may_match(&self, block_offset: usize, key: &[u8]) -> bool {
+        let index = block_offset >> self.base_log;
+        if index < self.filter_num {
+            let start = coding::decode_fixed32(&self.data[self.filter_offset_start + index * 4..]) as usize;
+            let limit = coding::decode_fixed32(&self.data[self.filter_offset_start + index * 4 + 4..]) as usize;
+            if start <= limit && limit <= self.filter_offset_start {
+                let filter_data = &self.data[start..limit];
+                return self.policy.key_may_match(filter_data, key);
+            } else if start == limit {
+                return false;
+            }
+        }
+        true
     }
 }
 
