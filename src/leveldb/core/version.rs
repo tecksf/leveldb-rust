@@ -540,6 +540,10 @@ impl VersionSet {
         set
     }
 
+    pub fn get(&self, internal_key: &InternalKey) -> io::Result<Vec<u8>> {
+        todo!()
+    }
+
     pub fn latest_version(&self) -> Rc<Version> {
         self.current.clone()
     }

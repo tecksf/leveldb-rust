@@ -4,7 +4,7 @@ use std::path::Path;
 use fslock::LockFile;
 use crate::leveldb::{logs, Options, WriteOptions};
 use crate::leveldb::core::batch::WriteBatch;
-use crate::leveldb::core::format::{Comparator, InternalKey};
+use crate::leveldb::core::format::{Comparator, InternalKey, LookupKey};
 use crate::leveldb::core::memory::MemoryTable;
 use crate::leveldb::core::sst::build_table;
 use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
@@ -69,6 +69,12 @@ impl Database {
         self.write(options, batch)
     }
 
+    pub fn delete<T: AsRef<str>>(&mut self, options: WriteOptions, key: T) -> io::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write(options, batch)
+    }
+
     pub fn write(&mut self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
         let mut last_sequence = self.versions.get_last_sequence();
         let mut write_batch = batch;
@@ -89,6 +95,33 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
+        let sequence = self.versions.get_last_sequence();
+        let lookup_key = LookupKey::new(key.as_ref(), sequence);
+        let not_found: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
+
+        if let Ok(result) = self.mutable.get(&lookup_key) {
+            return match result {
+                Some(value) => Ok(value),
+                _ => not_found,
+            };
+        }
+
+        if let Some(table) = &self.immutable {
+            if let Ok(result) = table.get(&lookup_key) {
+                return match result {
+                    Some(value) => Ok(value),
+                    _ => not_found,
+                };
+            }
+        }
+
+        let internal_key = lookup_key.extract_internal_key();
+        let result = self.versions.get(&internal_key);
+
+        result
     }
 
     fn make_room_for_write(&mut self, force: bool) -> io::Result<()> {
