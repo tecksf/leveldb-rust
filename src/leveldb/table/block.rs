@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::io;
 use std::rc::Rc;
 use crate::leveldb::{table, FilterPolicy};
@@ -60,6 +62,158 @@ impl Block {
 
     pub fn num_restarts(&self) -> u32 {
         coding::decode_fixed32(&self.data[self.data.len() - 4..])
+    }
+
+    pub fn iter(&self, compare: fn(&[u8], &[u8]) -> Ordering) -> BlockIterator {
+        BlockIterator::new(self.data.clone(), self.restart_offset, self.num_restarts() as usize, compare)
+    }
+}
+
+pub struct BlockIterator {
+    data: Rc<Vec<u8>>,
+    restart_offset: usize,
+    num_restarts: usize,
+    restart_index: Cell<usize>,
+    entry_offset: Cell<usize>,
+    key: RefCell<Vec<u8>>,
+    value: RefCell<Vec<u8>>,
+    compare: fn(&[u8], &[u8]) -> Ordering,
+}
+
+impl BlockIterator {
+    fn new(data: Rc<Vec<u8>>, restart_offset: usize, num_restarts: usize, compare: fn(&[u8], &[u8]) -> Ordering) -> Self {
+        Self {
+            data,
+            restart_offset,
+            num_restarts,
+            restart_index: Cell::new(num_restarts),
+            entry_offset: Cell::new(restart_offset),
+            key: RefCell::new(Vec::new()),
+            value: RefCell::new(Vec::new()),
+            compare,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.entry_offset.get() < self.restart_offset
+    }
+
+    pub fn key(&self) -> Vec<u8> {
+        Vec::from(self.key.borrow().as_slice())
+    }
+
+    pub fn value(&self) -> Vec<u8> {
+        Vec::from(self.value.borrow().as_slice())
+    }
+
+    fn next(&self) -> bool {
+        self.parse_next_key()
+    }
+
+    pub fn seek(&self, target: &[u8]) -> bool {
+        let mut left = 0;
+        let mut right = self.num_restarts - 1;
+
+        if self.is_valid() {
+            let result = (self.compare)(self.key.borrow().as_slice(), target);
+            if result.is_lt() {
+                left = self.restart_index.get();
+            } else if result.is_gt() {
+                right = self.restart_index.get();
+            } else {
+                return true;
+            }
+        }
+
+        while left < right {
+            let mid = (left + right + 1) / 2;
+            let region_offset = self.get_restart_point(mid);
+            let entry = &self.data[region_offset..];
+
+            if let Some((shared_len, non_shared_len, _, rest)) = Self::decode_entry(entry) {
+                if shared_len != 0 {
+                    return false;
+                }
+
+                let mid_key = &rest[..non_shared_len];
+                let result = (self.compare)(mid_key, target);
+                if result.is_lt() {
+                    left = mid;
+                } else if result.is_gt() {
+                    right = mid - 1;
+                } else {
+                    left = mid;
+                    break;
+                }
+            }
+        }
+
+        self.restart_index.set(left);
+        self.entry_offset.set(self.get_restart_point(left));
+        while self.parse_next_key() {
+            if (self.compare)(self.key.borrow().as_slice(), target).is_ge() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_restart_point(&self, index: usize) -> usize {
+        coding::decode_fixed32(&self.data[(self.restart_offset + index * 4)..]) as usize
+    }
+
+    fn decode_entry(data: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
+        if data.len() < 3 {
+            return None;
+        }
+
+        let mut offset: usize = 0;
+        let (mut shared_len, mut non_shared_len, mut value_len) = (data[0] as u32, data[1] as u32, data[2] as u32);
+        if (shared_len | non_shared_len | value_len) < 128 {
+            offset = 3;
+        } else {
+            let mut w: u8;
+
+            (shared_len, w) = coding::decode_variant32(data);
+            if w == 0 { return None; }
+            offset += w as usize;
+
+            (non_shared_len, w) = coding::decode_variant32(&data[offset..]);
+            if w == 0 { return None; }
+            offset += w as usize;
+
+            (value_len, w) = coding::decode_variant32(&data[offset..]);
+            if w == 0 { return None; }
+            offset += w as usize;
+        }
+
+        if data.len() - offset < (non_shared_len + value_len) as usize {
+            return None;
+        }
+
+        Some((shared_len as usize, non_shared_len as usize, value_len as usize, &data[offset..]))
+    }
+
+    fn parse_next_key(&self) -> bool {
+        if !self.is_valid() {
+            self.entry_offset.set(self.restart_offset);
+            self.restart_index.set(self.num_restarts);
+            return false;
+        }
+
+        let entry = &self.data[self.entry_offset.get()..];
+        if let Some((shared_len, non_shared_len, value_len, rest)) = Self::decode_entry(entry) {
+            let mut key = self.key.borrow_mut();
+            key.truncate(shared_len);
+            key.extend_from_slice(&rest[..non_shared_len]);
+            let mut value = self.value.borrow_mut();
+            value.clear();
+            value.extend_from_slice(&rest[non_shared_len..non_shared_len + value_len]);
+            self.entry_offset.set(self.entry_offset.get() + entry.len() - rest.len() + non_shared_len + value_len);
+            return true;
+        }
+
+        false
     }
 }
 
@@ -149,7 +303,28 @@ impl Footer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockHandle, Footer};
+    use crate::leveldb::core::format::UserKey;
+    use crate::leveldb::table::builder::BlockBuilder;
+    use super::{Block, BlockHandle, Footer};
+
+    fn create_block_data() -> Vec<u8> {
+        let data: [(&str, &str); 8] = [
+            ("123", "Data001"),
+            ("1234", "Data002"),
+            ("12345", "Data003"),
+            ("123456", "Data004"),
+            ("123abc", "Data005"),
+            ("123bcd", "Data006"),
+            ("123efg", "Data007"),
+            ("123efh", "Data008"),
+        ];
+
+        let mut builder = BlockBuilder::new(3);
+        for (key, value) in data {
+            builder.add(key.as_bytes(), value.as_bytes());
+        }
+        Vec::from(builder.finish())
+    }
 
     #[test]
     fn test_footer_block() {
@@ -164,5 +339,31 @@ mod tests {
         let f = result.unwrap();
         assert_eq!(f.meta_index_block_handle, meta_index_block_handle);
         assert_eq!(f.index_block_handle, index_block_handle);
+    }
+
+    #[test]
+    fn test_block_retrieve_key() {
+        let block = Block::new(create_block_data()).unwrap();
+        let iter = block.iter(|k1, k2| {
+            let uk1 = UserKey::new(k1);
+            let uk2 = UserKey::new(k2);
+            uk1.cmp(&uk2)
+        });
+        assert!(!iter.seek("abc".as_bytes()));
+        assert!(iter.seek("1234".as_bytes()));
+        assert_eq!(iter.value(), "Data002".as_bytes());
+
+        let expected = ["Data003", "Data004", "Data005", "Data006", "Data007", "Data008"];
+        let mut index = 0;
+        while iter.next() {
+            assert_eq!(iter.value(), expected[index].as_bytes());
+            index += 1;
+        }
+
+        assert!(iter.seek("123bcd".as_bytes()));
+        assert_eq!(iter.value(), "Data006".as_bytes());
+
+        assert!(iter.seek("123efg".as_bytes()));
+        assert_eq!(iter.value(), "Data007".as_bytes());
     }
 }
