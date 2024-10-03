@@ -98,6 +98,13 @@ impl BlockIterator {
         self.entry_offset.get() < self.restart_offset
     }
 
+    pub fn check_key<V>(&self, mut verify: V) -> bool
+        where V: FnMut(&[u8]) -> bool
+    {
+        let key = self.key.borrow();
+        verify(key.as_slice())
+    }
+
     pub fn key(&self) -> Vec<u8> {
         Vec::from(self.key.borrow().as_slice())
     }
