@@ -303,7 +303,7 @@ impl Footer {
 
 #[cfg(test)]
 mod tests {
-    use crate::leveldb::core::format::UserKey;
+    use crate::leveldb::core::format::{Comparator, UserKey};
     use crate::leveldb::table::builder::BlockBuilder;
     use super::{Block, BlockHandle, Footer};
 
@@ -344,11 +344,7 @@ mod tests {
     #[test]
     fn test_block_retrieve_key() {
         let block = Block::new(create_block_data()).unwrap();
-        let iter = block.iter(|k1, k2| {
-            let uk1 = UserKey::new(k1);
-            let uk2 = UserKey::new(k2);
-            uk1.cmp(&uk2)
-        });
+        let iter = block.iter(UserKey::compare);
         assert!(!iter.seek("abc".as_bytes()));
         assert!(iter.seek("1234".as_bytes()));
         assert_eq!(iter.value(), "Data002".as_bytes());

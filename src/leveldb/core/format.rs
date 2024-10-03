@@ -30,6 +30,7 @@ pub fn pack_sequence_and_type(sequence_number: u64, value_type: ValueType) -> u6
 
 pub trait Comparator {
     fn name() -> String;
+    fn compare(key1: &[u8], key2: &[u8]) -> Ordering;
     fn find_shortest_separator(&self, other: &Self) -> Vec<u8>;
     fn find_shortest_successor(&self) -> Vec<u8>;
 }
@@ -66,6 +67,12 @@ impl<'a> Into<&'a [u8]> for UserKey<'a> {
 impl Comparator for UserKey<'_> {
     fn name() -> String {
         String::from("leveldb.BytewiseComparator")
+    }
+
+    fn compare(key1: &[u8], key2: &[u8]) -> Ordering {
+        let k1 = UserKey::new(key1);
+        let k2 = UserKey::new(key2);
+        k1.cmp(&k2)
     }
 
     fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
@@ -194,6 +201,12 @@ impl Default for InternalKey {
 impl Comparator for InternalKey {
     fn name() -> String {
         String::from("leveldb.InternalKeyComparator")
+    }
+
+    fn compare(key1: &[u8], key2: &[u8]) -> Ordering {
+        let k1 = InternalKey::new(key1);
+        let k2 = InternalKey::new(key2);
+        k1.cmp(&k2)
     }
 
     fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
