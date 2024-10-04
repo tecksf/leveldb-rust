@@ -2,7 +2,7 @@ use std::io;
 use std::rc::Rc;
 use crate::leveldb::logs::file::RandomReaderView;
 use crate::leveldb::{CompressionType, FilterPolicy, Options};
-use crate::leveldb::core::format::{Comparator, UserKey};
+use crate::leveldb::core::format::{Comparator, InternalKey, UserKey, ValueType};
 use crate::leveldb::table::block::{Block, BlockHandle, Filter, Footer};
 use crate::leveldb::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::leveldb::utils::coding;
@@ -39,6 +39,46 @@ impl<T: RandomReaderView> Table<T> {
             index_block,
             filter,
         })
+    }
+
+    pub fn internal_get(&self, internal_key: &InternalKey) -> io::Result<Option<Vec<u8>>> {
+        let index_iter = self.index_block.iter(InternalKey::compare);
+        if index_iter.seek(internal_key.as_ref()) {
+            let value = index_iter.value();
+            let data_block_handle = BlockHandle::decode_from(value).map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
+            let data_block = self.read_data_block(&data_block_handle)?;
+
+            if let Some(filter) = &self.filter {
+                if !filter.key_may_match(data_block_handle.offset, internal_key.as_ref()) {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, ""));
+                }
+            }
+
+            let data_iter = data_block.iter(InternalKey::compare);
+            if data_iter.seek(internal_key.as_ref()) {
+                let user_key = internal_key.extract_user_key();
+                let mut value_type = ValueType::Unknown;
+                let verify = |key: &[u8]| -> bool {
+                    if key.len() >= 8 {
+                        let ik = InternalKey::new(key);
+                        let uk = ik.extract_user_key();
+                        value_type = ik.extract_value_type();
+                        return uk.cmp(&user_key).is_eq();
+                    }
+                    false
+                };
+
+                if data_iter.check_key(verify) {
+                    if value_type == ValueType::Insertion {
+                        return Ok(Some(data_iter.value()));
+                    } else if value_type == ValueType::Deletion {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        Err(io::Error::new(io::ErrorKind::NotFound, ""))
     }
 
     fn read_data_block(&self, index_block_handle: &BlockHandle) -> io::Result<Block> {
