@@ -7,9 +7,12 @@ use std::rc::Rc;
 use crate::leveldb::core::format;
 use crate::leveldb::core::format::{InternalKey, UserKey};
 use crate::leveldb::{logs, Options};
+use crate::leveldb::core::cache::TableCache;
 use crate::leveldb::logs::{file, filename, wal};
 use crate::leveldb::logs::filename::FileType;
 use crate::leveldb::utils::coding;
+
+type RefTableCache = Rc<RefCell<TableCache>>;
 
 #[derive(Clone, Eq)]
 pub struct FileMetaData {
@@ -113,6 +116,15 @@ impl Version {
         user_key.cmp(&meta.smallest.extract_user_key()) == Ordering::Less
     }
 
+    pub fn get<T>(&self, internal_key: &InternalKey, mut seek: T)
+        where T: FnMut(Rc<FileMetaData>) -> bool
+    {
+        let seek_wrapper = |level, file| {
+            seek(file)
+        };
+        self.for_each_overlapping(internal_key, seek_wrapper);
+    }
+
     pub fn pick_level_for_memory_table(&self, smallest: &UserKey, largest: &UserKey) -> usize {
         let mut level = 0;
         if !self.overlap_in_level(0, smallest, largest) {
@@ -185,6 +197,44 @@ impl Version {
             }
         }
         overlaps
+    }
+
+    fn for_each_overlapping<T>(&self, internal_key: &InternalKey, mut seek: T)
+        where T: FnMut(usize, Rc<FileMetaData>) -> bool
+    {
+        let user_key = internal_key.extract_user_key();
+        let mut tmp = Vec::<Rc<FileMetaData>>::new();
+        self.files[0].iter().for_each(|f| {
+            if user_key >= f.smallest.extract_user_key() &&
+                user_key <= f.largest.extract_user_key() {
+                tmp.push(f.clone());
+            }
+        });
+
+        if !tmp.is_empty() {
+            tmp.sort_by(|f1, f2| f2.number.cmp(&f1.number));
+            for f in tmp {
+                if seek(0, f) {
+                    return;
+                }
+            }
+        }
+
+        for level in 1..logs::NUM_LEVELS {
+            let files = &self.files[level];
+            if files.len() == 0 {
+                continue;
+            }
+
+            let index = files.binary_search_by(
+                |meta| meta.largest.cmp(&internal_key)).unwrap_or_else(|index| index);
+            if index < files.len() {
+                let f = self.files[level][index].clone();
+                if user_key >= f.smallest.extract_user_key() && seek(level, f) {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -519,6 +569,7 @@ pub struct VersionSet {
     manifest_file_number: u64,
     manifest_logger: Option<wal::Writer<file::WritableFile>>,
     compact_pointers: [InternalKey; logs::NUM_LEVELS],
+    table_cache: RefTableCache,
 }
 
 impl VersionSet {
@@ -535,13 +586,31 @@ impl VersionSet {
             manifest_file_number: 0,
             manifest_logger: None,
             compact_pointers: Default::default(),
+            table_cache: Rc::new(RefCell::new(TableCache::new(db_name, options))),
         };
         set.versions.push_back(set.current.clone());
         set
     }
 
     pub fn get(&self, internal_key: &InternalKey) -> io::Result<Vec<u8>> {
-        todo!()
+        let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
+        let version = self.latest_version();
+        let seek_cache = |file: Rc<FileMetaData>| {
+            let mut table_cache = self.table_cache.borrow_mut();
+            match table_cache.get(file.number, file.file_size, internal_key) {
+                Ok(table_result) => {
+                    if let Some(value) = table_result {
+                        result = Ok(value);
+                    };
+                    return true;
+                }
+                Err(err) => result = Err(err),
+            };
+            false
+        };
+
+        version.get(internal_key, seek_cache);
+        result
     }
 
     pub fn latest_version(&self) -> Rc<Version> {
