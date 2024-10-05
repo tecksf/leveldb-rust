@@ -4,3 +4,4 @@ pub mod db;
 mod memory;
 mod sst;
 mod version;
+mod cache;
