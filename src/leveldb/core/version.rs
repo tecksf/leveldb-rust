@@ -65,6 +65,12 @@ impl Ord for FileMetaData {
     }
 }
 
+#[derive(Default)]
+pub struct GetStatistics {
+    seek_file: Option<Rc<FileMetaData>>,
+    seek_file_level: usize,
+}
+
 fn total_file_size(files: &Vec<Rc<FileMetaData>>) -> u64 {
     let mut sum: u64 = 0;
     for file in files {
@@ -116,13 +122,40 @@ impl Version {
         user_key.cmp(&meta.smallest.extract_user_key()) == Ordering::Less
     }
 
-    pub fn get<T>(&self, internal_key: &InternalKey, mut seek: T)
+    pub fn update_statistics(&self, stats: &GetStatistics) -> bool {
+        if let Some(file) = &stats.seek_file {
+            let mut count = file.allowed_seeks.get();
+            count -= 1;
+            if count <= 0 && self.file_to_compact.borrow().is_none() {
+                self.file_to_compact_level.set(stats.seek_file_level);
+                self.file_to_compact.replace(Some(file.clone()));
+            }
+            file.allowed_seeks.set(count);
+            return true;
+        }
+        false
+    }
+
+    pub fn get<T>(&self, internal_key: &InternalKey, mut seek: T) -> bool
         where T: FnMut(Rc<FileMetaData>) -> bool
     {
-        let seek_wrapper = |level, file| {
+        let mut stats = GetStatistics::default();
+        let mut last_file_read: Option<Rc<FileMetaData>> = None;
+        let mut last_file_read_level: usize = 0;
+
+        let seek_wrapper = |level: usize, file: Rc<FileMetaData>| -> bool {
+            if stats.seek_file.is_none() && last_file_read.is_some() {
+                stats.seek_file = last_file_read.clone();
+                stats.seek_file_level = last_file_read_level;
+            }
+
+            last_file_read = Some(file.clone());
+            last_file_read_level = level;
+
             seek(file)
         };
         self.for_each_overlapping(internal_key, seek_wrapper);
+        self.update_statistics(&stats)
     }
 
     pub fn pick_level_for_memory_table(&self, smallest: &UserKey, largest: &UserKey) -> usize {
@@ -592,7 +625,7 @@ impl VersionSet {
         set
     }
 
-    pub fn get(&self, internal_key: &InternalKey) -> io::Result<Vec<u8>> {
+    pub fn get(&self, internal_key: &InternalKey) -> (io::Result<Vec<u8>>, bool) {
         let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
         let version = self.latest_version();
         let seek_cache = |file: Rc<FileMetaData>| {
@@ -609,8 +642,8 @@ impl VersionSet {
             false
         };
 
-        version.get(internal_key, seek_cache);
-        result
+        let has_stats_update = version.get(internal_key, seek_cache);
+        (result, has_stats_update)
     }
 
     pub fn latest_version(&self) -> Rc<Version> {

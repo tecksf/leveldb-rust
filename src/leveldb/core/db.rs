@@ -119,7 +119,10 @@ impl Database {
         }
 
         let internal_key = lookup_key.extract_internal_key();
-        let result = self.versions.get(&internal_key);
+        let (result, has_stats_update) = self.versions.get(&internal_key);
+        if has_stats_update {
+            // self.maybe_schedule_compaction();
+        }
 
         result
     }
