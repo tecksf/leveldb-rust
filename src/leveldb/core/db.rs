@@ -298,6 +298,28 @@ impl Database {
         self.compact_memory_table();
     }
 
+    fn background_compaction(&mut self) {
+        if self.immutable.is_some() {
+            self.compact_memory_table();
+            return;
+        }
+
+        if let Some(mut compaction) = self.versions.pick_compaction() {
+            if compaction.is_trivial_move() {
+                let level = compaction.level;
+                let file = compaction.inputs[0][0].clone();
+                compaction.edit.remove_file(level, file.number);
+                compaction.edit.add_file(level + 1, file.as_ref().clone());
+                self.versions.log_and_apply(compaction.edit).unwrap();
+                log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, self.versions.level_summary());
+            } else {
+                self.do_compaction_work();
+            }
+        }
+    }
+
+    fn do_compaction_work(&self) {}
+
     fn compact_memory_table(&mut self) {
         let base = self.versions.latest_version();
         let file_number = self.versions.get_new_file_number();

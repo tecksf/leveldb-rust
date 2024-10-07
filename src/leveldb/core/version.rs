@@ -89,6 +89,44 @@ fn max_bytes_for_level(level: usize) -> f64 {
     result
 }
 
+fn target_file_size(options: &Options) -> u64 {
+    options.max_file_size
+}
+
+fn max_grand_parent_overlap_bytes(options: &Options) -> u64 {
+    10 * target_file_size(&options)
+}
+
+fn expanded_compaction_byte_size_limit(options: &Options) -> u64 {
+    25 * target_file_size(&options)
+}
+
+pub struct Compaction {
+    options: Options,
+    pub level: usize,
+    pub edit: VersionEdit,
+    pub inputs: [Vec<Rc<FileMetaData>>; 2],
+    pub grandparents: Vec<Rc<FileMetaData>>,
+}
+
+impl Compaction {
+    pub fn new(options: Options, level: usize) -> Self {
+        Self {
+            level,
+            options,
+            edit: VersionEdit::new(),
+            inputs: Default::default(),
+            grandparents: Default::default(),
+        }
+    }
+
+    pub fn is_trivial_move(&self) -> bool {
+        self.inputs[0].len() == 1 &&
+            self.inputs[1].len() == 0 &&
+            total_file_size(&self.grandparents) <= max_grand_parent_overlap_bytes(&self.options)
+    }
+}
+
 pub struct Version {
     refs: Cell<i32>,
     files: [Vec<Rc<FileMetaData>>; logs::NUM_LEVELS],
@@ -825,6 +863,14 @@ impl VersionSet {
         Ok(())
     }
 
+    pub fn level_summary(&self) -> String {
+        format!("file[ {0} {1} {2} {3} {4} {5} {6} ]",
+                self.current.files[0].len(), self.current.files[1].len(),
+                self.current.files[2].len(), self.current.files[3].len(),
+                self.current.files[4].len(), self.current.files[5].len(),
+                self.current.files[6].len())
+    }
+
     fn append_version(&mut self, version: Version) {
         let latest_version = Rc::new(version);
         self.versions.push_back(latest_version.clone());
@@ -889,6 +935,108 @@ impl VersionSet {
         }
 
         Ok(())
+    }
+
+    fn get_range(inputs: &Vec<Rc<FileMetaData>>) -> (InternalKey, InternalKey) {
+        let mut smallest = InternalKey::default();
+        let mut largest = InternalKey::default();
+
+        if inputs.len() > 0 {
+            smallest.assign(&inputs[0].smallest);
+            largest.assign(&inputs[0].largest);
+
+            for file in &inputs[1..] {
+                if file.smallest <= smallest {
+                    smallest.assign(&file.smallest);
+                }
+
+                if file.largest >= largest {
+                    largest.assign(&file.largest);
+                }
+            }
+        }
+
+        (smallest, largest)
+    }
+
+    fn get_range2(inputs1: &Vec<Rc<FileMetaData>>, inputs2: &Vec<Rc<FileMetaData>>) -> (InternalKey, InternalKey) {
+        let mut all = Vec::with_capacity(inputs1.len() + inputs2.len());
+        all.extend_from_slice(inputs1);
+        all.extend_from_slice(inputs2);
+        Self::get_range(&all)
+    }
+
+    fn get_other_inputs(&mut self, compaction: &mut Compaction) {
+        let level = compaction.level;
+        let (mut start, mut limit) = Self::get_range(&compaction.inputs[0]);
+        compaction.inputs[1] = self.current.get_over_lapping_inputs(level + 1, &start, &limit);
+
+        let (mut smallest, mut largest) = Self::get_range2(&compaction.inputs[0], &compaction.inputs[1]);
+        if !compaction.inputs[1].is_empty() {
+            let expanded0 = self.current.get_over_lapping_inputs(level, &smallest, &largest);
+            let inputs0_size = total_file_size(&compaction.inputs[0]);
+            let inputs1_size = total_file_size(&compaction.inputs[1]);
+            let expanded0_size = total_file_size(&expanded0);
+            if expanded0.len() > compaction.inputs[0].len() && inputs1_size + expanded0_size < expanded_compaction_byte_size_limit(&self.options) {
+                let (new_start, new_limit) = Self::get_range(&expanded0);
+                let expanded1 = self.current.get_over_lapping_inputs(level + 1, &new_start, &new_limit);
+                if expanded1.len() == compaction.inputs[1].len() {
+                    log::info!("Expanding level[{0}] {1}+{2} ({3}+{4} bytes) to {5}+{6} ({7}+{8} bytes)", level,
+                        compaction.inputs[0].len(), compaction.inputs[1].len(), inputs0_size, inputs1_size,
+                        expanded0.len(), expanded1.len(), expanded0_size, inputs1_size
+                    );
+                    start = new_start;
+                    limit = new_limit;
+                    compaction.inputs[0] = expanded0;
+                    compaction.inputs[1] = expanded1;
+                    (smallest, largest) = Self::get_range2(&compaction.inputs[0], &compaction.inputs[1]);
+                }
+            }
+        }
+
+        if level + 2 < logs::NUM_LEVELS {
+            compaction.grandparents = self.current.get_over_lapping_inputs(level + 2, &smallest, &largest);
+        }
+
+        compaction.edit.set_compact_pointer(level, limit.clone());
+        self.compact_pointers[level] = limit;
+    }
+
+    pub fn pick_compaction(&mut self) -> Option<Compaction> {
+        let mut compaction: Compaction;
+        let level: usize;
+        let size_compaction = self.current.compaction_score >= 1.0;
+        let seek_compaction = self.current.file_to_compact.borrow().is_some();
+
+        if size_compaction {
+            level = self.current.compaction_level;
+            compaction = Compaction::new(self.options, level);
+            for file in &self.current.files[level] {
+                if file.largest > self.compact_pointers[level] {
+                    compaction.inputs[0].push(file.clone());
+                    break;
+                }
+            }
+            if compaction.inputs[0].is_empty() {
+                compaction.inputs[0].push(self.current.files[level][0].clone());
+            }
+        } else if seek_compaction {
+            level = self.current.file_to_compact_level.get();
+            compaction = Compaction::new(self.options, level);
+            let file = self.current.file_to_compact.borrow().clone().unwrap();
+            compaction.inputs[0].push(file);
+        } else {
+            return None;
+        }
+
+        if level == 0 {
+            let (smallest, largest) = Self::get_range(&compaction.inputs[0]);
+            compaction.inputs[0] = self.current.get_over_lapping_inputs(0, &smallest, &largest);
+        }
+
+        self.get_other_inputs(&mut compaction);
+
+        Some(compaction)
     }
 }
 
@@ -1015,6 +1163,18 @@ mod tests {
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("350"), &UserKey::new("450")), 0);
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("120"), &UserKey::new("150")), 0);
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("370"), &UserKey::new("380")), 1);
+
+        version.compaction_level = 0;
+        version.compaction_score = 1.2;
+        let mut version_set = VersionSet::new("test", Options::default());
+        version_set.compact_pointers[0] = InternalKey::restore("280", 9, ValueType::Insertion);
+        version_set.append_version(version);
+        let compaction = version_set.pick_compaction().unwrap();
+        assert_eq!(version_set.compact_pointers[0].extract_user_key().as_ref(), "320".as_bytes());
+        assert_file_range(&compaction.inputs[0][0], "000", "100");
+        assert_file_range(&compaction.inputs[0][1], "200", "300");
+        assert_file_range(&compaction.inputs[0][2], "260", "320");
+        assert_file_range(&compaction.inputs[1][0], "100", "360");
     }
 
     #[test]
