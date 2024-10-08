@@ -212,7 +212,28 @@ impl MemoryTable {
     }
 
     pub fn get(&self, lookup_key: &LookupKey) -> io::Result<Option<Vec<u8>>> {
-        todo!()
+        let mut prev = vec![Link::Nil; MAX_HEIGHT];
+        if let Link::Ptr(ptr) = self.table.find(&lookup_key, prev.as_mut_slice()) {
+            let result = &ptr.borrow().key;
+            return Ok(Some(Vec::from(result.get_raw_value())));
+        }
+
+        if let Link::Ptr(p1) = &prev[0] {
+            if let Link::Ptr(p2) = p1.borrow().get_next(0) {
+                let seek_key = &p2.borrow().key;
+                let key1 = seek_key.extract_internal_key();
+                let key2 = lookup_key.extract_internal_key();
+                if key1.extract_user_key() == key2.extract_user_key() {
+                    return if key1.extract_value_type() == ValueType::Insertion {
+                        Ok(Some(Vec::from(seek_key.get_raw_value())))
+                    } else {
+                        Ok(None)
+                    };
+                }
+            }
+        }
+
+        Err(io::Error::new(io::ErrorKind::NotFound, ""))
     }
 }
 
