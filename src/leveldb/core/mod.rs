@@ -5,3 +5,4 @@ mod memory;
 mod sst;
 mod version;
 mod cache;
+mod iterator;
