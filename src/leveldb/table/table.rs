@@ -3,7 +3,8 @@ use std::rc::Rc;
 use crate::leveldb::logs::file::RandomReaderView;
 use crate::leveldb::{CompressionType, FilterPolicy, Options};
 use crate::leveldb::core::format::{Comparator, InternalKey, UserKey, ValueType};
-use crate::leveldb::table::block::{Block, BlockHandle, Filter, Footer};
+use crate::leveldb::core::iterator::{IteratorGen, LevelIterator, TwoLevelIterator};
+use crate::leveldb::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
 use crate::leveldb::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::leveldb::utils::coding;
 
@@ -12,6 +13,29 @@ pub struct Table<T> {
     file: Rc<T>,
     index_block: Block,
     filter: Option<Filter>,
+}
+
+pub struct BlockIteratorGen<T> {
+    file: Rc<T>,
+    paranoid_checks: bool,
+}
+
+impl<T: RandomReaderView> BlockIteratorGen<T> {
+    fn new(file: Rc<T>, paranoid_checks: bool) -> Self {
+        Self {
+            file,
+            paranoid_checks,
+        }
+    }
+}
+
+impl<T: RandomReaderView> IteratorGen for BlockIteratorGen<T> {
+    fn gen(&self, data: &[u8]) -> Option<Box<dyn LevelIterator>> {
+        let data_block_handle = BlockHandle::decode_from(data).ok()?;
+        let result = Table::<T>::read_block(self.paranoid_checks, &self.file, &data_block_handle).ok()?;
+        let block = Block::new(result).ok()?;
+        Some(Box::new(block.iter(InternalKey::compare)))
+    }
 }
 
 impl<T: RandomReaderView> Table<T> {
@@ -79,6 +103,11 @@ impl<T: RandomReaderView> Table<T> {
         }
 
         Err(io::Error::new(io::ErrorKind::NotFound, ""))
+    }
+
+    pub fn iter(&self) -> Box<TwoLevelIterator<BlockIterator, BlockIteratorGen<T>>> {
+        let generator = BlockIteratorGen::<T>::new(self.file.clone(), self.options.paranoid_checks);
+        Box::new(TwoLevelIterator::new(self.index_block.iter(InternalKey::compare), generator))
     }
 
     fn read_data_block(&self, index_block_handle: &BlockHandle) -> io::Result<Block> {

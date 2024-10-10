@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::io;
 use std::rc::Rc;
 use crate::leveldb::{table, FilterPolicy};
+use crate::leveldb::core::iterator::LevelIterator;
 use crate::leveldb::utils::coding;
 
 #[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
@@ -94,75 +95,11 @@ impl BlockIterator {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
-        self.entry_offset.get() < self.restart_offset
-    }
-
     pub fn check_key<V>(&self, mut verify: V) -> bool
         where V: FnMut(&[u8]) -> bool
     {
         let key = self.key.borrow();
         verify(key.as_slice())
-    }
-
-    pub fn key(&self) -> Vec<u8> {
-        Vec::from(self.key.borrow().as_slice())
-    }
-
-    pub fn value(&self) -> Vec<u8> {
-        Vec::from(self.value.borrow().as_slice())
-    }
-
-    fn next(&self) -> bool {
-        self.parse_next_key()
-    }
-
-    pub fn seek(&self, target: &[u8]) -> bool {
-        let mut left = 0;
-        let mut right = self.num_restarts - 1;
-
-        if self.is_valid() {
-            let result = (self.compare)(self.key.borrow().as_slice(), target);
-            if result.is_lt() {
-                left = self.restart_index.get();
-            } else if result.is_gt() {
-                right = self.restart_index.get();
-            } else {
-                return true;
-            }
-        }
-
-        while left < right {
-            let mid = (left + right + 1) / 2;
-            let region_offset = self.get_restart_point(mid);
-            let entry = &self.data[region_offset..];
-
-            if let Some((shared_len, non_shared_len, _, rest)) = Self::decode_entry(entry) {
-                if shared_len != 0 {
-                    return false;
-                }
-
-                let mid_key = &rest[..non_shared_len];
-                let result = (self.compare)(mid_key, target);
-                if result.is_lt() {
-                    left = mid;
-                } else if result.is_gt() {
-                    right = mid - 1;
-                } else {
-                    left = mid;
-                    break;
-                }
-            }
-        }
-
-        self.restart_index.set(left);
-        self.entry_offset.set(self.get_restart_point(left));
-        while self.parse_next_key() {
-            if (self.compare)(self.key.borrow().as_slice(), target).is_ge() {
-                return true;
-            }
-        }
-        false
     }
 
     fn get_restart_point(&self, index: usize) -> usize {
@@ -221,6 +158,83 @@ impl BlockIterator {
         }
 
         false
+    }
+}
+
+impl LevelIterator for BlockIterator {
+    fn is_valid(&self) -> bool {
+        self.entry_offset.get() < self.restart_offset
+    }
+
+    fn key(&self) -> Vec<u8> {
+        Vec::from(self.key.borrow().as_slice())
+    }
+
+    fn value(&self) -> Vec<u8> {
+        Vec::from(self.value.borrow().as_slice())
+    }
+
+    fn next(&self) -> bool {
+        self.parse_next_key()
+    }
+
+    fn seek(&self, target: &[u8]) -> bool {
+        let mut left = 0;
+        let mut right = self.num_restarts - 1;
+
+        if self.is_valid() {
+            let result = (self.compare)(self.key.borrow().as_slice(), target);
+            if result.is_lt() {
+                left = self.restart_index.get();
+            } else if result.is_gt() {
+                right = self.restart_index.get();
+            } else {
+                return true;
+            }
+        }
+
+        while left < right {
+            let mid = (left + right + 1) / 2;
+            let region_offset = self.get_restart_point(mid);
+            let entry = &self.data[region_offset..];
+
+            if let Some((shared_len, non_shared_len, _, rest)) = Self::decode_entry(entry) {
+                if shared_len != 0 {
+                    return false;
+                }
+
+                let mid_key = &rest[..non_shared_len];
+                let result = (self.compare)(mid_key, target);
+                if result.is_lt() {
+                    left = mid;
+                } else if result.is_gt() {
+                    right = mid - 1;
+                } else {
+                    left = mid;
+                    break;
+                }
+            }
+        }
+
+        self.restart_index.set(left);
+        self.entry_offset.set(self.get_restart_point(left));
+        while self.parse_next_key() {
+            if (self.compare)(self.key.borrow().as_slice(), target).is_ge() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn seek_to_first(&self) {
+        self.restart_index.set(self.num_restarts);
+        self.entry_offset.set(self.restart_offset);
+        self.key.borrow_mut().clear();
+        self.value.borrow_mut().clear();
+    }
+
+    fn seek_to_last(&self) {
+        todo!()
     }
 }
 
@@ -311,6 +325,7 @@ impl Footer {
 #[cfg(test)]
 mod tests {
     use crate::leveldb::core::format::{Comparator, UserKey};
+    use crate::leveldb::core::iterator::LevelIterator;
     use crate::leveldb::table::builder::BlockBuilder;
     use super::{Block, BlockHandle, Footer};
 
