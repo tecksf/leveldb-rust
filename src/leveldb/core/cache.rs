@@ -4,6 +4,7 @@ use std::hash::Hash;
 use std::io;
 use std::rc::{Rc, Weak};
 use crate::leveldb::core::format::InternalKey;
+use crate::leveldb::core::iterator::LevelIterator;
 use crate::leveldb::Options;
 use crate::leveldb::logs::{file, filename};
 use crate::leveldb::table::table::Table;
@@ -278,6 +279,16 @@ impl TableCache {
             let sst = self.cache.add(file_number, table);
             Ok(sst)
         }
+    }
+
+    pub fn iter(&mut self, file_number: u64, file_size: u64) -> Option<Box<dyn LevelIterator>> {
+        let mut iter: Option<Box<dyn LevelIterator>> = None;
+        if let Ok(sst) = self.find_table(file_number, file_size) {
+            TableLRUCache::value(sst, |table| {
+                iter = Some(table.iter());
+            });
+        }
+        iter
     }
 }
 
