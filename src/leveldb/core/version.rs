@@ -5,9 +5,10 @@ use std::{fs, io};
 use std::path::Path;
 use std::rc::Rc;
 use crate::leveldb::core::format;
-use crate::leveldb::core::format::{InternalKey, UserKey};
+use crate::leveldb::core::format::{Comparator, InternalKey, UserKey};
 use crate::leveldb::{logs, Options};
 use crate::leveldb::core::cache::TableCache;
+use crate::leveldb::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
 use crate::leveldb::logs::{file, filename, wal};
 use crate::leveldb::logs::filename::FileType;
 use crate::leveldb::utils::coding;
@@ -308,6 +309,84 @@ impl Version {
         }
     }
 }
+
+pub struct VersionLevelFileIterator {
+    index: Cell<usize>,
+    files: Vec<Rc<FileMetaData>>,
+}
+
+impl VersionLevelFileIterator {
+    pub fn new(files: Vec<Rc<FileMetaData>>) -> Self {
+        Self {
+            index: Cell::new(files.len()),
+            files,
+        }
+    }
+}
+
+impl LevelIterator for VersionLevelFileIterator {
+    fn is_valid(&self) -> bool {
+        self.index.get() < self.files.len()
+    }
+
+    fn key(&self) -> Vec<u8> {
+        Vec::from(self.files[self.index.get()].largest.as_ref())
+    }
+
+    fn value(&self) -> Vec<u8> {
+        let mut result = Vec::new();
+        coding::put_fixed64_into_vec(&mut result, self.files[self.index.get()].number);
+        coding::put_fixed64_into_vec(&mut result, self.files[self.index.get()].file_size);
+        result
+    }
+
+    fn next(&self) -> bool {
+        self.index.set(self.index.get() + 1);
+        self.is_valid()
+    }
+
+    fn seek(&self, target: &[u8]) -> bool {
+        let result = self.files.binary_search_by(|file| {
+            file.largest.as_ref().cmp(target)
+        });
+
+        self.index.set(result.unwrap_or_else(|n| n));
+        self.is_valid()
+    }
+
+    fn seek_to_first(&self) {
+        self.index.set(0);
+    }
+
+    fn seek_to_last(&self) {
+        self.index.set(self.files.len());
+    }
+}
+
+struct FileIteratorGen {
+    table_cache: RefTableCache,
+}
+
+impl FileIteratorGen {
+    fn new(table_cache: RefTableCache) -> Self {
+        Self {
+            table_cache
+        }
+    }
+}
+
+impl IteratorGen for FileIteratorGen {
+    fn gen(&self, data: &[u8]) -> Option<Box<dyn LevelIterator>> {
+        if data.len() != 16 {
+            return None;
+        }
+
+        let file_number = coding::decode_fixed64(data);
+        let file_size = coding::decode_fixed64(&data[8..]);
+        self.table_cache.borrow_mut().iter(file_number, file_size)
+    }
+}
+
 
 #[repr(u32)]
 enum Tag {
@@ -1037,6 +1116,33 @@ impl VersionSet {
         self.get_other_inputs(&mut compaction);
 
         Some(compaction)
+    }
+
+    pub fn make_input_iterator(&self, compaction: &Compaction) -> MergingIterator {
+        let space = if compaction.level == 0 { compaction.inputs[0].len() + 1 } else { 2 };
+        let mut iterator_list = Vec::with_capacity(space);
+        for level in 0..2 {
+            if compaction.inputs[level].is_empty() {
+                continue;
+            }
+
+            if compaction.level + level == 0 {
+                for file in &compaction.inputs[level] {
+                    let table_iter = self.table_cache.borrow_mut().iter(file.number, file.file_size);
+                    if let Some(iter) = table_iter {
+                        iterator_list.push(iter);
+                    }
+                }
+            } else {
+                let iter = TwoLevelIterator::new(
+                    VersionLevelFileIterator::new(compaction.inputs[level].clone()),
+                    FileIteratorGen::new(self.table_cache.clone()),
+                );
+                iterator_list.push(Box::new(iter));
+            }
+        }
+
+        MergingIterator::new(InternalKey::compare, iterator_list)
     }
 }
 
