@@ -1,5 +1,5 @@
-use crate::leveldb::core::format::ValueType;
-use crate::leveldb::utils::coding;
+use crate::core::format::ValueType;
+use crate::utils::coding;
 
 const PAYLOAD_HEADER_SIZE: usize = 12;
 const PAYLOAD_SEQUENCE_OFFSET: usize = 0;

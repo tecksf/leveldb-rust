@@ -1,8 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::io;
-use crate::leveldb::logs::file::{ReaderView, WriterView};
-use crate::leveldb::utils::coding;
-use crate::leveldb::utils::common::Interval;
+use crate::logs::file::{ReaderView, WriterView};
+use crate::utils::coding;
+use crate::utils::common::Interval;
 
 #[repr(u8)]
 #[derive(Eq, PartialEq, Debug)]
@@ -251,7 +251,7 @@ impl<T: ReaderView> Reader<T> {
 #[cfg(test)]
 mod tests {
     use super::{BLOCK_SIZE, Writer, Reader, RecordType};
-    use crate::leveldb::logs::file::tests::{WritableMemory, ReadableMemory};
+    use crate::logs::file::tests::{WritableMemory, ReadableMemory};
 
     #[test]
     fn test_wal_write_and_read_record() {

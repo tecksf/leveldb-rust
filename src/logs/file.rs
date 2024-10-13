@@ -2,7 +2,7 @@ use std::{fs, io};
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
-use crate::leveldb::logs::filename;
+use crate::logs::filename;
 
 pub trait WriterView {
     fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize>;

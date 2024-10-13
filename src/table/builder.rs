@@ -1,10 +1,10 @@
 use std::io;
-use crate::leveldb::logs::file::WriterView;
-use crate::leveldb::{CompressionType, Options, table, FilterPolicy};
-use crate::leveldb::core::format::{Comparator, InternalKey};
-use crate::leveldb::table::block::{BlockHandle, Footer};
-use crate::leveldb::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
-use crate::leveldb::utils::coding;
+use crate::logs::file::WriterView;
+use crate::{CompressionType, Options, table, FilterPolicy};
+use crate::core::format::{Comparator, InternalKey};
+use crate::table::block::{BlockHandle, Footer};
+use crate::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
+use crate::utils::coding;
 
 struct BlockChunk {
     data_block: BlockBuilder,
@@ -350,12 +350,12 @@ impl FilterBlockBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::leveldb::core::format::{InternalKey, ValueType};
+    use crate::core::format::{InternalKey, ValueType};
     use super::{BlockBuilder, TableBuilder};
-    use crate::leveldb::Options;
-    use crate::leveldb::logs::file::tests::WritableMemory;
-    use crate::leveldb::table::block::Footer;
-    use crate::leveldb::utils::coding;
+    use crate::Options;
+    use crate::logs::file::tests::WritableMemory;
+    use crate::table::block::Footer;
+    use crate::utils::coding;
 
     #[test]
     fn test_data_block_constructor() {

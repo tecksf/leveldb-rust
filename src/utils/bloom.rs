@@ -1,6 +1,6 @@
-use crate::leveldb::core::format::InternalKey;
-use crate::leveldb::FilterPolicy;
-use crate::leveldb::utils::common::hash;
+use crate::core::format::InternalKey;
+use crate::FilterPolicy;
+use crate::utils::common::hash;
 
 pub struct BloomFilterPolicy {
     // k: num of hash
@@ -121,7 +121,7 @@ impl<P: FilterPolicy> FilterPolicy for InternalFilterPolicy<P> {
 
 #[cfg(test)]
 mod tests {
-    use crate::leveldb::FilterPolicy;
+    use crate::FilterPolicy;
     use super::BloomFilterPolicy;
 
     #[test]

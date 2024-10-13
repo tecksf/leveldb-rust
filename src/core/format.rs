@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use crate::leveldb::utils::coding;
+use crate::utils::coding;
 
 #[repr(u8)]
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]

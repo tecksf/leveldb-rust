@@ -2,9 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::io;
 use std::rc::Rc;
-use crate::leveldb::{table, FilterPolicy};
-use crate::leveldb::core::iterator::LevelIterator;
-use crate::leveldb::utils::coding;
+use crate::{table, FilterPolicy};
+use crate::core::iterator::LevelIterator;
+use crate::utils::coding;
 
 #[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
 pub struct BlockHandle {
@@ -324,9 +324,9 @@ impl Footer {
 
 #[cfg(test)]
 mod tests {
-    use crate::leveldb::core::format::{Comparator, UserKey};
-    use crate::leveldb::core::iterator::LevelIterator;
-    use crate::leveldb::table::builder::BlockBuilder;
+    use crate::core::format::{Comparator, UserKey};
+    use crate::core::iterator::LevelIterator;
+    use crate::table::builder::BlockBuilder;
     use super::{Block, BlockHandle, Footer};
 
     fn create_block_data() -> Vec<u8> {

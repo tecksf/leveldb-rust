@@ -1,6 +1,4 @@
-use crate::leveldb::{Options, WriteOptions};
-
-mod leveldb;
+use leveldb::{Options, WriteOptions};
 
 fn main() {
     let mut options = Options::default();

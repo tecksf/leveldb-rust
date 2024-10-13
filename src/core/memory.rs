@@ -4,10 +4,10 @@ use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use rand::Rng;
-use crate::leveldb::core::batch::WriteBatch;
-use crate::leveldb::core::format;
-use crate::leveldb::core::format::{LookupKey, ValueType};
-use crate::leveldb::utils::coding;
+use crate::core::batch::WriteBatch;
+use crate::core::format;
+use crate::core::format::{LookupKey, ValueType};
+use crate::utils::coding;
 
 const MAX_HEIGHT: usize = 12;
 
@@ -239,8 +239,8 @@ impl MemoryTable {
 
 #[cfg(test)]
 mod tests {
-    use crate::leveldb::core::format::ValueType;
-    use crate::leveldb::core::memory::{MemoryTable, SkipList};
+    use crate::core::format::ValueType;
+    use crate::core::memory::{MemoryTable, SkipList};
 
     #[test]
     fn test_skip_list_insert_and_delete() {

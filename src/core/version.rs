@@ -4,14 +4,14 @@ use std::collections::{BTreeSet, VecDeque};
 use std::{fs, io};
 use std::path::Path;
 use std::rc::Rc;
-use crate::leveldb::core::format;
-use crate::leveldb::core::format::{Comparator, InternalKey, UserKey};
-use crate::leveldb::{logs, Options};
-use crate::leveldb::core::cache::TableCache;
-use crate::leveldb::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
-use crate::leveldb::logs::{file, filename, wal};
-use crate::leveldb::logs::filename::FileType;
-use crate::leveldb::utils::coding;
+use crate::core::format;
+use crate::core::format::{Comparator, InternalKey, UserKey};
+use crate::{logs, Options};
+use crate::core::cache::TableCache;
+use crate::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
+use crate::logs::{file, filename, wal};
+use crate::logs::filename::FileType;
+use crate::utils::coding;
 
 type RefTableCache = Rc<RefCell<TableCache>>;
 
@@ -1149,8 +1149,8 @@ impl VersionSet {
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
-    use crate::leveldb::core::format::{InternalKey, UserKey, ValueType};
-    use crate::leveldb::Options;
+    use crate::core::format::{InternalKey, UserKey, ValueType};
+    use crate::Options;
     use super::{FileMetaData, Version, VersionBuilder, VersionEdit, VersionSet};
 
     fn create_file_meta<T: AsRef<[u8]>>(number: u64, key1: T, key2: T) -> FileMetaData {

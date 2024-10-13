@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use crate::leveldb::utils::coding;
+use crate::utils::coding;
 
 #[derive(Clone, Default)]
 pub struct Interval {

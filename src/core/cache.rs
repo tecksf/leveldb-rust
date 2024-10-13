@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
 use std::rc::{Rc, Weak};
-use crate::leveldb::core::format::InternalKey;
-use crate::leveldb::core::iterator::LevelIterator;
-use crate::leveldb::Options;
-use crate::leveldb::logs::{file, filename};
-use crate::leveldb::table::table::Table;
-use crate::leveldb::utils::coding;
-use crate::leveldb::utils::common::hash;
+use crate::core::format::InternalKey;
+use crate::core::iterator::LevelIterator;
+use crate::Options;
+use crate::logs::{file, filename};
+use crate::table::table::Table;
+use crate::utils::coding;
+use crate::utils::common::hash;
 
 struct Node<T> {
     value: Option<T>,

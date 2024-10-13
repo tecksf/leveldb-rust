@@ -2,15 +2,15 @@ use std::{fs, io, thread, time};
 use std::ffi::OsString;
 use std::path::Path;
 use fslock::LockFile;
-use crate::leveldb::{logs, Options, WriteOptions};
-use crate::leveldb::core::batch::WriteBatch;
-use crate::leveldb::core::format::{Comparator, InternalKey, LookupKey};
-use crate::leveldb::core::memory::MemoryTable;
-use crate::leveldb::core::sst::build_table;
-use crate::leveldb::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
-use crate::leveldb::logs::file::WritableFile;
-use crate::leveldb::logs::{file, filename, wal};
-use crate::leveldb::logs::filename::FileType;
+use crate::{logs, Options, WriteOptions};
+use crate::core::batch::WriteBatch;
+use crate::core::format::{Comparator, InternalKey, LookupKey};
+use crate::core::memory::MemoryTable;
+use crate::core::sst::build_table;
+use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
+use crate::logs::file::WritableFile;
+use crate::logs::{file, filename, wal};
+use crate::logs::filename::FileType;
 
 pub struct Database {
     name: String,

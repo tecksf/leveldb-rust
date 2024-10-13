@@ -1,11 +1,11 @@
 use std::{fs, io};
-use crate::leveldb::core::format::InternalKey;
-use crate::leveldb::core::memory::MemoryTableIterator;
-use crate::leveldb::core::version::FileMetaData;
-use crate::leveldb::logs::file::WritableFile;
-use crate::leveldb::logs::filename;
-use crate::leveldb::Options;
-use crate::leveldb::table::builder::TableBuilder;
+use crate::core::format::InternalKey;
+use crate::core::memory::MemoryTableIterator;
+use crate::core::version::FileMetaData;
+use crate::logs::file::WritableFile;
+use crate::logs::filename;
+use crate::Options;
+use crate::table::builder::TableBuilder;
 
 pub fn build_table(options: Options, path: &str, mut iter: MemoryTableIterator, file_number: u64) -> io::Result<FileMetaData> {
     let file_name = filename::make_table_file_name(path, file_number);

@@ -1,12 +1,12 @@
 use std::io;
 use std::rc::Rc;
-use crate::leveldb::logs::file::RandomReaderView;
-use crate::leveldb::{CompressionType, FilterPolicy, Options};
-use crate::leveldb::core::format::{Comparator, InternalKey, UserKey, ValueType};
-use crate::leveldb::core::iterator::{IteratorGen, LevelIterator, TwoLevelIterator};
-use crate::leveldb::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
-use crate::leveldb::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
-use crate::leveldb::utils::coding;
+use crate::logs::file::RandomReaderView;
+use crate::{CompressionType, FilterPolicy, Options};
+use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
+use crate::core::iterator::{IteratorGen, LevelIterator, TwoLevelIterator};
+use crate::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
+use crate::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
+use crate::utils::coding;
 
 pub struct Table<T> {
     options: Options,
