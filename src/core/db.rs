@@ -1,6 +1,10 @@
 use std::{fs, io, thread, time};
+use std::cell::{Cell, RefCell};
+use std::collections::LinkedList;
 use std::ffi::OsString;
 use std::path::Path;
+use std::rc::Rc;
+use parking_lot::{Mutex, Condvar};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
@@ -12,6 +16,14 @@ use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
 
+struct Producer {
+    batch: WriteBatch,
+    sync: bool,
+    done: Cell<bool>,
+    cond: Condvar,
+    result: Cell<io::Result<()>>,
+}
+
 pub struct Database {
     name: String,
     options: Options,
@@ -20,6 +32,7 @@ pub struct Database {
     mutable: MemoryTable,
     immutable: Option<MemoryTable>,
     versions: VersionSet,
+    producers: Mutex<LinkedList<Rc<Producer>>>,
 }
 
 impl Database {
@@ -35,6 +48,7 @@ impl Database {
             mutable: MemoryTable::new(),
             immutable: None,
             versions: VersionSet::new(path.as_ref(), options),
+            producers: Mutex::new(LinkedList::new()),
         };
 
         db.init()?;
@@ -76,11 +90,33 @@ impl Database {
     }
 
     pub fn write(&mut self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
-        let mut last_sequence = self.versions.get_last_sequence();
-        let mut write_batch = batch;
+        let producer = Rc::new(Producer {
+            batch,
+            sync: options.sync,
+            done: Cell::new(false),
+            cond: Condvar::new(),
+            result: Cell::new(Ok(())),
+        });
 
-        let status = self.make_room_for_write(false);
-        if status.is_ok() {
+        {
+            let mut producers = self.producers.lock();
+            producers.push_back(producer.clone());
+            while !producer.done.get() && !Rc::ptr_eq(&producer, &producers.front().unwrap().clone()) {
+                producer.cond.wait(&mut producers);
+            }
+
+            if producer.done.get() {
+                return producer.result.replace(Ok(()));
+            }
+        }
+
+        let mut last_sequence = self.versions.get_last_sequence();
+        let mut last_producer = producer.clone();
+        let mut write_batch = WriteBatch::new();
+
+        let result = self.make_room_for_write(false);
+        if result.is_ok() {
+            last_producer = self.build_batch_group(&mut write_batch);
             write_batch.set_sequence(last_sequence + 1);
             last_sequence += write_batch.get_count() as u64;
 
@@ -94,7 +130,28 @@ impl Database {
             self.versions.set_last_sequence(last_sequence);
         }
 
-        Ok(())
+        {
+            let mut producers = self.producers.lock();
+            while let Some(ready) = producers.pop_front() {
+                if !Rc::ptr_eq(&ready, &producer) {
+                    ready.done.set(true);
+                    ready.cond.notify_one();
+                    if let Err(err) = &result {
+                        ready.result.set(Err(io::Error::new(err.kind(), err.to_string())));
+                    }
+                }
+
+                if Rc::ptr_eq(&ready, &last_producer) {
+                    break;
+                }
+            }
+
+            if !producers.is_empty() {
+                producers.front().unwrap().cond.notify_one();
+            }
+        }
+
+        result
     }
 
     pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
@@ -125,6 +182,38 @@ impl Database {
         }
 
         result
+    }
+
+    fn build_batch_group(&self, result: &mut WriteBatch) -> Rc<Producer> {
+        let producers = self.producers.lock();
+        let first = producers.front().unwrap().clone();
+        let mut last = first.clone();
+
+        result.extend(&first.batch);
+
+        let mut size = first.batch.size();
+        let mut max_size: usize = 1 << 20;
+        if size <= (128 << 10) {
+            max_size = size + (128 << 10);
+        }
+
+        let mut it = producers.iter();
+        it.next();
+        while let Some(p) = it.next() {
+            if p.sync && !first.sync {
+                break;
+            }
+
+            size += p.batch.size();
+            if size > max_size {
+                break;
+            }
+
+            last = p.clone();
+            result.extend(&p.batch);
+        }
+
+        last
     }
 
     fn make_room_for_write(&mut self, force: bool) -> io::Result<()> {
