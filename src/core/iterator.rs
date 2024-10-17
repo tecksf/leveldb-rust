@@ -51,25 +51,50 @@ impl<Iter, Gen> TwoLevelIterator<Iter, Gen>
             }
         }
     }
+
+    fn skip_empty_data_blocks_backward(&self) {
+        while self.data_iter.borrow().as_ref().map(|iter| !iter.is_valid()).unwrap_or(false) {
+            if !self.index_iter.is_valid() {
+                self.data_iter.replace(None);
+                return;
+            }
+            self.index_iter.next();
+            self.init_data_block();
+        }
+    }
 }
 
 impl<Iter, Gen> LevelIterator for TwoLevelIterator<Iter, Gen>
     where Iter: LevelIterator, Gen: IteratorGen
 {
     fn is_valid(&self) -> bool {
-        todo!()
+        if let Some(iter) = self.data_iter.borrow().as_ref() {
+            return iter.is_valid();
+        }
+        false
     }
 
     fn key(&self) -> Vec<u8> {
-        todo!()
+        if let Some(iter) = self.data_iter.borrow().as_ref() {
+            return iter.key();
+        }
+        Vec::new()
     }
 
     fn value(&self) -> Vec<u8> {
-        todo!()
+        if let Some(iter) = self.data_iter.borrow().as_ref() {
+            return iter.value();
+        }
+        Vec::new()
     }
 
     fn next(&self) -> bool {
-        todo!()
+        if let Some(iter) = self.data_iter.borrow().as_ref() {
+            iter.next();
+            self.skip_empty_data_blocks_backward();
+            return true;
+        }
+        false
     }
 
     fn seek(&self, target: &[u8]) -> bool {
