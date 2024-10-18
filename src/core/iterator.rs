@@ -40,26 +40,28 @@ impl<Iter, Gen> TwoLevelIterator<Iter, Gen>
             self.data_iter.replace(None);
         } else {
             let value = self.index_iter.value();
-            match self.data_iter.borrow().as_ref() {
-                Some(_) if self.data_block_handle.borrow().cmp(&value).is_eq() => {}
-                _ => {
-                    let iter = self.iterator_function.gen(value.as_slice());
-                    self.data_block_handle.borrow_mut().clear();
-                    self.data_block_handle.borrow_mut().extend(value);
-                    self.data_iter.replace(iter);
-                }
+            let has_data_iter = self.data_iter.borrow().is_some();
+            if !has_data_iter || !self.data_block_handle.borrow().cmp(&value).is_eq() {
+                let iter = self.iterator_function.gen(value.as_slice());
+                self.data_block_handle.borrow_mut().clear();
+                self.data_block_handle.borrow_mut().extend(value);
+                self.data_iter.replace(iter);
             }
         }
     }
 
-    fn skip_empty_data_blocks_backward(&self) {
-        while self.data_iter.borrow().as_ref().map(|iter| !iter.is_valid()).unwrap_or(false) {
+    fn skip_empty_data_blocks_forward(&self) {
+        while self.data_iter.borrow().is_none() || !self.data_iter.borrow().as_ref().unwrap().is_valid() {
             if !self.index_iter.is_valid() {
                 self.data_iter.replace(None);
                 return;
             }
+
             self.index_iter.next();
             self.init_data_block();
+            if let Some(iter) = self.data_iter.borrow().as_ref() {
+                iter.seek_to_first();
+            }
         }
     }
 }
@@ -91,10 +93,9 @@ impl<Iter, Gen> LevelIterator for TwoLevelIterator<Iter, Gen>
     fn next(&self) -> bool {
         if let Some(iter) = self.data_iter.borrow().as_ref() {
             iter.next();
-            self.skip_empty_data_blocks_backward();
-            return true;
         }
-        false
+        self.skip_empty_data_blocks_forward();
+        self.is_valid()
     }
 
     fn seek(&self, target: &[u8]) -> bool {
@@ -108,7 +109,12 @@ impl<Iter, Gen> LevelIterator for TwoLevelIterator<Iter, Gen>
     }
 
     fn seek_to_first(&self) {
-        todo!()
+        self.index_iter.seek_to_first();
+        self.init_data_block();
+        if let Some(iter) = self.data_iter.borrow().as_ref() {
+            iter.seek_to_first();
+        }
+        self.skip_empty_data_blocks_forward();
     }
 
     fn seek_to_last(&self) {
@@ -236,15 +242,15 @@ impl LevelIterator for MergingIterator {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use super::{LevelIterator, MergingIterator};
+    use super::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
 
-    struct Data {
-        data: Vec<String>,
+    struct DataIterator {
+        data: Vec<&'static str>,
         index: Cell<usize>,
     }
 
-    impl Data {
-        fn new(data: Vec<String>) -> Self {
+    impl DataIterator {
+        fn new(data: Vec<&'static str>) -> Self {
             Self {
                 data,
                 index: Cell::new(0),
@@ -252,7 +258,7 @@ mod tests {
         }
     }
 
-    impl LevelIterator for Data {
+    impl LevelIterator for DataIterator {
         fn is_valid(&self) -> bool {
             self.index.get() < self.data.len()
         }
@@ -288,20 +294,58 @@ mod tests {
         }
     }
 
+    struct DataIteratorGen {
+        data: Vec<&'static str>,
+    }
+
+    impl DataIteratorGen {
+        fn new(data: Vec<&'static str>) -> Self {
+            Self {
+                data,
+            }
+        }
+    }
+
+    impl IteratorGen for DataIteratorGen {
+        fn gen(&self, data: &[u8]) -> Option<Box<dyn LevelIterator>> {
+            let index = std::str::from_utf8(data).unwrap().parse().ok()?;
+            if index + 3 > self.data.len() {
+                return None;
+            }
+            Some(Box::new(DataIterator::new(self.data[index..index + 3].to_vec())))
+        }
+    }
+
     #[test]
     fn test_multi_iterators_merged() {
-        let d1 = Box::new(Data::new(vec!["123".to_string(), "abc".to_string(), "opq".to_string()]));
-        let d2 = Box::new(Data::new(vec!["789".to_string(), "efg".to_string(), "lmn".to_string()]));
-        let d3 = Box::new(Data::new(vec!["145".to_string(), "189".to_string(), "def".to_string()]));
-        let d4 = Box::new(Data::new(vec!["123".to_string(), "456".to_string(), "789".to_string()]));
+        let d1 = Box::new(DataIterator::new(vec!["123", "abc", "opq"]));
+        let d2 = Box::new(DataIterator::new(vec!["789", "efg", "lmn"]));
+        let d3 = Box::new(DataIterator::new(vec!["145", "189", "def"]));
+        let d4 = Box::new(DataIterator::new(vec!["123", "456", "789"]));
 
         let mut result = Vec::new();
         let iterator = MergingIterator::new(|x, y| { x.cmp(y) }, vec![d1, d2, d3, d4]);
         iterator.seek_to_first();
         while iterator.is_valid() {
-            result.push(String::from_utf8_lossy(iterator.key().as_slice()).to_string());
+            let key = iterator.key();
+            result.push(String::from_utf8(key).unwrap());
             iterator.next();
         }
         assert_eq!(result, vec!["123", "145", "189", "456", "789", "abc", "def", "efg", "lmn", "opq"]);
+    }
+
+    #[test]
+    fn test_two_level_iterator_seek() {
+        let index_iterator = DataIterator::new(vec!["3", "0", "6"]);
+        let generator = DataIteratorGen::new(vec!["100", "200", "300", "400", "500", "600", "700", "800", "900"]);
+        let iterator = TwoLevelIterator::new(index_iterator, generator);
+        let mut result = Vec::new();
+        iterator.seek_to_first();
+        while iterator.is_valid() {
+            let key = iterator.key();
+            result.push(String::from_utf8(key).unwrap());
+            iterator.next();
+        }
+        assert_eq!(result, vec!["400", "500", "600", "100", "200", "300", "700", "800", "900"]);
     }
 }
