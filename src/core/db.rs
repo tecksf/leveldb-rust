@@ -10,6 +10,7 @@ use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
 use crate::core::format::{Comparator, InternalKey, LookupKey};
 use crate::core::memory::MemoryTable;
+use crate::core::schedule::Dispatcher;
 use crate::core::sst::build_table;
 use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::logs::file::WritableFile;
@@ -33,6 +34,7 @@ pub struct Database {
     immutable: Option<MemoryTable>,
     versions: VersionSet,
     producers: Mutex<LinkedList<Rc<Producer>>>,
+    dispatcher: Dispatcher,
 }
 
 impl Database {
@@ -49,6 +51,7 @@ impl Database {
             immutable: None,
             versions: VersionSet::new(path.as_ref(), options),
             producers: Mutex::new(LinkedList::new()),
+            dispatcher: Dispatcher::new(),
         };
 
         db.init()?;
