@@ -48,7 +48,6 @@ impl Dispatcher {
         if let Some(handle) = self.background_thread.take() {
             handle.join().unwrap();
         }
-        self.background_thread = None;
     }
 
     fn background_entry(tasks: Arc<Mutex<VecDeque<Task>>>, background_thread_cv: Arc<Condvar>, alive: Arc<AtomicBool>) {
