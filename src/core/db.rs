@@ -4,6 +4,8 @@ use std::collections::LinkedList;
 use std::ffi::OsString;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use parking_lot::{Mutex, Condvar};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
@@ -12,7 +14,7 @@ use crate::core::format::{Comparator, InternalKey, LookupKey};
 use crate::core::memory::MemoryTable;
 use crate::core::schedule::Dispatcher;
 use crate::core::sst::build_table;
-use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
+use crate::core::version::{Compaction, FileMetaData, Version, VersionEdit, VersionSet};
 use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
@@ -25,6 +27,12 @@ struct Producer {
     result: Cell<io::Result<()>>,
 }
 
+struct WriteRequest {
+    sync: bool,
+    batch: WriteBatch,
+    notify: Box<dyn FnOnce(io::Result<()>) + Send>,
+}
+
 pub struct Database {
     name: String,
     options: Options,
@@ -35,12 +43,16 @@ pub struct Database {
     versions: VersionSet,
     producers: Mutex<LinkedList<Rc<Producer>>>,
     dispatcher: Dispatcher,
+    compaction_sender: crossbeam_channel::Sender<WriteRequest>,
+    compaction_receiver: crossbeam_channel::Receiver<WriteRequest>,
 }
 
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
         log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
         log::info!("Opening database at path: {}", path.as_ref());
+
+        let (compaction_sender, compaction_receiver) = crossbeam_channel::unbounded();
 
         let mut db = Database {
             name: String::from(path.as_ref()),
@@ -52,6 +64,8 @@ impl Database {
             versions: VersionSet::new(path.as_ref(), options),
             producers: Mutex::new(LinkedList::new()),
             dispatcher: Dispatcher::new(),
+            compaction_sender,
+            compaction_receiver,
         };
 
         db.init()?;
@@ -78,6 +92,66 @@ impl Database {
         db.remove_obsolete_files();
 
         Ok(db)
+    }
+
+    pub fn start(&mut self) {
+        crossbeam_channel::select! {
+            recv(self.compaction_receiver) -> request => {
+                if let Ok(req) = request {
+                    self.handle_write_requests(Rc::new(req));
+                }
+            },
+
+            default(Duration::from_millis(500)) => {
+
+            }
+        }
+    }
+
+    fn handle_write_requests(&mut self, request: Rc<WriteRequest>) {
+        let mut requests = LinkedList::new();
+        requests.push_back(request);
+
+        while !requests.is_empty() {
+            let mut last_sequence = self.versions.get_last_sequence();
+            let mut write_batch = WriteBatch::new();
+
+            let mut last_request = requests.front().unwrap().clone();
+            let sync = last_request.sync;
+            let result = self.make_room_for_write(false);
+            if result.is_ok() {
+                while let Ok(request) = self.compaction_receiver.try_recv() {
+                    requests.push_back(Rc::new(request));
+                }
+
+                last_request = Self::build_batch_group(&requests, &mut write_batch);
+                write_batch.set_sequence(last_sequence + 1);
+                last_sequence += write_batch.get_count() as u64;
+
+                if let Some(logger) = &mut self.write_ahead_logger {
+                    let _ = logger.add_record(write_batch.get_payload());
+                    if sync {
+                        let _ = logger.sync();
+                    }
+                    self.mutable.insert(&write_batch);
+                }
+                self.versions.set_last_sequence(last_sequence);
+            }
+
+            while let Some(ready) = requests.pop_front() {
+                if !Rc::ptr_eq(&ready, &last_request) {
+                    if let Ok(mut ready_request) = Rc::try_unwrap(ready) {
+                        let res = match &result {
+                            Ok(()) => Ok(()),
+                            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+                        };
+                        (ready_request.notify)(res);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn put<T: AsRef<str>>(&mut self, options: WriteOptions, key: T, value: T) -> io::Result<()> {
@@ -119,7 +193,7 @@ impl Database {
 
         let result = self.make_room_for_write(false);
         if result.is_ok() {
-            last_producer = self.build_batch_group(&mut write_batch);
+            // last_producer = self.build_batch_group(&mut write_batch);
             write_batch.set_sequence(last_sequence + 1);
             last_sequence += write_batch.get_count() as u64;
 
@@ -187,9 +261,8 @@ impl Database {
         result
     }
 
-    fn build_batch_group(&self, result: &mut WriteBatch) -> Rc<Producer> {
-        let producers = self.producers.lock();
-        let first = producers.front().unwrap().clone();
+    fn build_batch_group(requests: &LinkedList<Rc<WriteRequest>>, result: &mut WriteBatch) -> Rc<WriteRequest> {
+        let first = requests.front().unwrap().clone();
         let mut last = first.clone();
 
         result.extend(&first.batch);
@@ -200,7 +273,7 @@ impl Database {
             max_size = size + (128 << 10);
         }
 
-        let mut it = producers.iter();
+        let mut it = requests.iter();
         it.next();
         while let Some(p) = it.next() {
             if p.sync && !first.sync {
@@ -405,16 +478,20 @@ impl Database {
                 self.versions.log_and_apply(compaction.edit).unwrap();
                 log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, self.versions.level_summary());
             } else {
-                self.do_compaction_work();
+                self.do_compaction_work(&compaction);
             }
         }
     }
 
-    fn do_compaction_work(&self) {}
+    fn do_compaction_work(&self, compaction: &Compaction) {
+        let iterator = self.versions.make_input_iterator(compaction);
+    }
 
     fn compact_memory_table(&mut self) {
         let base = self.versions.latest_version();
         let file_number = self.versions.get_new_file_number();
+
+        self.dispatcher.schedule(Box::new(|| {}));
 
         if let Some(table) = &self.immutable {
             let result = self.write_level0_table(Some(&base), file_number, table);

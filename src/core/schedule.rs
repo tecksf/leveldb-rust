@@ -22,7 +22,7 @@ impl Dispatcher {
         }
     }
 
-    pub fn dispatch(&mut self, task: Task) {
+    pub fn schedule(&mut self, task: Task) {
         let mut tasks = self.tasks.lock().unwrap();
 
         if self.background_thread.is_none() {
@@ -80,7 +80,7 @@ mod tests {
 
         for i in 0..10 {
             let number = result.clone();
-            dispatcher.dispatch(Box::new(move || {
+            dispatcher.schedule(Box::new(move || {
                 let mut num = number.lock().unwrap();
                 *num += 10;
             }));
