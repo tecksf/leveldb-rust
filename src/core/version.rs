@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::{fs, io};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicI32, AtomicU32};
 use crate::core::format;
 use crate::core::format::{Comparator, InternalKey, UserKey};
@@ -84,11 +84,11 @@ impl Ord for FileMetaData {
 
 #[derive(Default)]
 pub struct GetStatistics {
-    seek_file: Option<Rc<FileMetaData>>,
+    seek_file: Option<Arc<FileMetaData>>,
     seek_file_level: usize,
 }
 
-fn total_file_size(files: &Vec<Rc<FileMetaData>>) -> u64 {
+fn total_file_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
     let mut sum: u64 = 0;
     for file in files {
         sum += file.file_size;
@@ -122,8 +122,8 @@ pub struct Compaction {
     options: Options,
     pub level: usize,
     pub edit: VersionEdit,
-    pub inputs: [Vec<Rc<FileMetaData>>; 2],
-    pub grandparents: Vec<Rc<FileMetaData>>,
+    pub inputs: [Vec<Arc<FileMetaData>>; 2],
+    pub grandparents: Vec<Arc<FileMetaData>>,
 }
 
 impl Compaction {
@@ -144,13 +144,17 @@ impl Compaction {
     }
 }
 
+struct SeekCompactionInfo {
+    level: usize,
+    file: Arc<FileMetaData>,
+}
+
 pub struct Version {
-    refs: Cell<i32>,
-    files: [Vec<Rc<FileMetaData>>; logs::NUM_LEVELS],
+    refs: AtomicI32,
+    files: [Vec<Arc<FileMetaData>>; logs::NUM_LEVELS],
 
     // seek compaction
-    file_to_compact: RefCell<Option<Rc<FileMetaData>>>,
-    file_to_compact_level: Cell<usize>,
+    file_to_compact: RwLock<Option<SeekCompactionInfo>>,
 
     // size compaction
     compaction_score: f64,
@@ -160,10 +164,9 @@ pub struct Version {
 impl Version {
     pub fn new() -> Self {
         Self {
-            refs: Cell::new(0),
+            refs: AtomicI32::new(0),
             files: Default::default(),
-            file_to_compact: RefCell::new(None),
-            file_to_compact_level: Cell::new(0),
+            file_to_compact: RwLock::new(None),
             compaction_level: 0,
             compaction_score: -1.0,
         }
@@ -178,11 +181,18 @@ impl Version {
     }
 
     pub fn update_statistics(&self, stats: &GetStatistics) -> bool {
-        if let Some(file) = &stats.seek_file {
-            let count = file.allowed_seeks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if count - 1 <= 0 && self.file_to_compact.borrow().is_none() {
-                self.file_to_compact_level.set(stats.seek_file_level);
-                self.file_to_compact.replace(Some(file.clone()));
+        if let Some(seek_file) = &stats.seek_file {
+            let count = seek_file.allowed_seeks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if count - 1 <= 0 {
+                if let Ok(mut guard) = self.file_to_compact.write() {
+                    if guard.is_none() {
+                        let seek = SeekCompactionInfo {
+                            file: seek_file.clone(),
+                            level: stats.seek_file_level,
+                        };
+                        *guard = Some(seek);
+                    }
+                }
             }
             return true;
         }
@@ -190,13 +200,13 @@ impl Version {
     }
 
     pub fn get<T>(&self, internal_key: &InternalKey, mut seek: T) -> bool
-        where T: FnMut(Rc<FileMetaData>) -> bool
+        where T: FnMut(Arc<FileMetaData>) -> bool
     {
         let mut stats = GetStatistics::default();
-        let mut last_file_read: Option<Rc<FileMetaData>> = None;
+        let mut last_file_read: Option<Arc<FileMetaData>> = None;
         let mut last_file_read_level: usize = 0;
 
-        let seek_wrapper = |level: usize, file: Rc<FileMetaData>| -> bool {
+        let seek_wrapper = |level: usize, file: Arc<FileMetaData>| -> bool {
             if stats.seek_file.is_none() && last_file_read.is_some() {
                 stats.seek_file = last_file_read.clone();
                 stats.seek_file_level = last_file_read_level;
@@ -254,8 +264,8 @@ impl Version {
         !Self::before_file(largest, &files[index])
     }
 
-    fn get_over_lapping_inputs(&self, level: usize, smallest: &InternalKey, largest: &InternalKey) -> Vec<Rc<FileMetaData>> {
-        let mut overlaps = Vec::<Rc<FileMetaData>>::new();
+    fn get_over_lapping_inputs(&self, level: usize, smallest: &InternalKey, largest: &InternalKey) -> Vec<Arc<FileMetaData>> {
+        let mut overlaps = Vec::<Arc<FileMetaData>>::new();
         let mut begin = smallest.extract_user_key();
         let mut end = largest.extract_user_key();
 
@@ -286,10 +296,10 @@ impl Version {
     }
 
     fn for_each_overlapping<T>(&self, internal_key: &InternalKey, mut seek: T)
-        where T: FnMut(usize, Rc<FileMetaData>) -> bool
+        where T: FnMut(usize, Arc<FileMetaData>) -> bool
     {
         let user_key = internal_key.extract_user_key();
-        let mut tmp = Vec::<Rc<FileMetaData>>::new();
+        let mut tmp = Vec::<Arc<FileMetaData>>::new();
         self.files[0].iter().for_each(|f| {
             if user_key >= f.smallest.extract_user_key() &&
                 user_key <= f.largest.extract_user_key() {
@@ -326,11 +336,11 @@ impl Version {
 
 pub struct VersionLevelFileIterator {
     index: Cell<usize>,
-    files: Vec<Rc<FileMetaData>>,
+    files: Vec<Arc<FileMetaData>>,
 }
 
 impl VersionLevelFileIterator {
-    pub fn new(files: Vec<Rc<FileMetaData>>) -> Self {
+    pub fn new(files: Vec<Arc<FileMetaData>>) -> Self {
         Self {
             index: Cell::new(files.len()),
             files,
@@ -643,17 +653,17 @@ impl VersionEdit {
 #[derive(Default)]
 struct LevelFileState {
     deleted_files: BTreeSet<u64>,
-    added_files: BTreeSet<Rc<FileMetaData>>,
+    added_files: BTreeSet<Arc<FileMetaData>>,
 }
 
 struct VersionBuilder<'a> {
-    version: Rc<Version>,
+    version: Arc<Version>,
     version_set: &'a mut VersionSet,
     levels: [LevelFileState; logs::NUM_LEVELS],
 }
 
 impl<'a> VersionBuilder<'a> {
-    fn new(version_set: &'a mut VersionSet, version: Rc<Version>) -> Self {
+    fn new(version_set: &'a mut VersionSet, version: Arc<Version>) -> Self {
         Self {
             version,
             version_set,
@@ -680,7 +690,7 @@ impl<'a> VersionBuilder<'a> {
             }
             file_meta.allowed_seeks.store(count, std::sync::atomic::Ordering::Relaxed);
             self.levels[*level].deleted_files.remove(&file_meta.number);
-            self.levels[*level].added_files.insert(Rc::new(file_meta));
+            self.levels[*level].added_files.insert(Arc::new(file_meta));
         }
     }
 
@@ -709,7 +719,7 @@ impl<'a> VersionBuilder<'a> {
         new_version
     }
 
-    fn maybe_add_file(&self, version: &mut Version, level: usize, meta: Rc<FileMetaData>) {
+    fn maybe_add_file(&self, version: &mut Version, level: usize, meta: Arc<FileMetaData>) {
         if self.levels[level].deleted_files.contains(&meta.number) {
             log::debug!("{} file is deleted: do nothing", meta.number);
         } else {
@@ -725,8 +735,8 @@ impl<'a> VersionBuilder<'a> {
 pub struct VersionSet {
     db_name: String,
     options: Options,
-    versions: VecDeque<Rc<Version>>,
-    current: Rc<Version>,
+    versions: VecDeque<Arc<Version>>,
+    current: Arc<Version>,
     next_file_number: Cell<u64>,
     last_sequence: Cell<u64>,
     log_number: u64,
@@ -743,7 +753,7 @@ impl VersionSet {
             db_name: String::from(db_name),
             options,
             versions: VecDeque::new(),
-            current: Rc::new(Version::new()),
+            current: Arc::new(Version::new()),
             next_file_number: Cell::new(2),
             last_sequence: Cell::new(0),
             log_number: 0,
@@ -760,7 +770,7 @@ impl VersionSet {
     pub fn get(&self, internal_key: &InternalKey) -> (io::Result<Vec<u8>>, bool) {
         let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
         let version = self.latest_version();
-        let seek_cache = |file: Rc<FileMetaData>| {
+        let seek_cache = |file: Arc<FileMetaData>| {
             let mut table_cache = self.table_cache.borrow_mut();
             match table_cache.get(file.number, file.file_size, internal_key) {
                 Ok(table_result) => {
@@ -778,7 +788,7 @@ impl VersionSet {
         (result, has_stats_update)
     }
 
-    pub fn latest_version(&self) -> Rc<Version> {
+    pub fn latest_version(&self) -> Arc<Version> {
         self.current.clone()
     }
 
@@ -966,7 +976,7 @@ impl VersionSet {
     }
 
     fn append_version(&mut self, version: Version) {
-        let latest_version = Rc::new(version);
+        let latest_version = Arc::new(version);
         self.versions.push_back(latest_version.clone());
         self.current = latest_version;
     }
@@ -1031,7 +1041,7 @@ impl VersionSet {
         Ok(())
     }
 
-    fn get_range(inputs: &Vec<Rc<FileMetaData>>) -> (InternalKey, InternalKey) {
+    fn get_range(inputs: &Vec<Arc<FileMetaData>>) -> (InternalKey, InternalKey) {
         let mut smallest = InternalKey::default();
         let mut largest = InternalKey::default();
 
@@ -1053,7 +1063,7 @@ impl VersionSet {
         (smallest, largest)
     }
 
-    fn get_range2(inputs1: &Vec<Rc<FileMetaData>>, inputs2: &Vec<Rc<FileMetaData>>) -> (InternalKey, InternalKey) {
+    fn get_range2(inputs1: &Vec<Arc<FileMetaData>>, inputs2: &Vec<Arc<FileMetaData>>) -> (InternalKey, InternalKey) {
         let mut all = Vec::with_capacity(inputs1.len() + inputs2.len());
         all.extend_from_slice(inputs1);
         all.extend_from_slice(inputs2);
@@ -1100,7 +1110,6 @@ impl VersionSet {
         let mut compaction: Compaction;
         let level: usize;
         let size_compaction = self.current.compaction_score >= 1.0;
-        let seek_compaction = self.current.file_to_compact.borrow().is_some();
 
         if size_compaction {
             level = self.current.compaction_level;
@@ -1114,11 +1123,10 @@ impl VersionSet {
             if compaction.inputs[0].is_empty() {
                 compaction.inputs[0].push(self.current.files[level][0].clone());
             }
-        } else if seek_compaction {
-            level = self.current.file_to_compact_level.get();
-            compaction = Compaction::new(self.options, level);
-            let file = self.current.file_to_compact.borrow().clone().unwrap();
-            compaction.inputs[0].push(file);
+        } else if let Some(seek_compaction) = self.current.file_to_compact.read().unwrap().as_ref() {
+            level = seek_compaction.level;
+            compaction = Compaction::new(self.options, seek_compaction.level);
+            compaction.inputs[0].push(seek_compaction.file.clone());
         } else {
             return None;
         }
@@ -1163,7 +1171,7 @@ impl VersionSet {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
     use crate::core::format::{InternalKey, UserKey, ValueType};
     use crate::Options;
     use super::{FileMetaData, Version, VersionBuilder, VersionEdit, VersionSet};
@@ -1243,7 +1251,7 @@ mod tests {
         edit
     }
 
-    fn assert_file_range<T: AsRef<[u8]>>(file: &Rc<FileMetaData>, begin: T, end: T) {
+    fn assert_file_range<T: AsRef<[u8]>>(file: &Arc<FileMetaData>, begin: T, end: T) {
         assert_eq!(file.smallest.extract_user_key().as_ref(), begin.as_ref());
         assert_eq!(file.largest.extract_user_key().as_ref(), end.as_ref());
     }
@@ -1263,15 +1271,15 @@ mod tests {
         ];
         let mut version = Version::new();
         for i in 0..4usize {
-            version.files[0].push(Rc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
+            version.files[0].push(Arc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
         }
 
         for i in 4..7usize {
-            version.files[1].push(Rc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
+            version.files[1].push(Arc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
         }
 
         for i in 7..9usize {
-            version.files[2].push(Rc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
+            version.files[2].push(Arc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
         }
 
         let key1 = InternalKey::restore("210", 9, ValueType::Insertion);
@@ -1318,7 +1326,7 @@ mod tests {
     #[test]
     fn test_merge_multi_version_edit() {
         let mut version_set = VersionSet::new("test", Options::default());
-        let base_version = Rc::new(Version::new());
+        let base_version = Arc::new(Version::new());
         let mut builder = VersionBuilder::new(&mut version_set, base_version);
 
         let edit1 = create_version_edit1();
