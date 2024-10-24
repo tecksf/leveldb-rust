@@ -4,6 +4,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::{fs, io};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU32};
 use crate::core::format;
 use crate::core::format::{Comparator, InternalKey, UserKey};
 use crate::{logs, Options};
@@ -15,10 +17,9 @@ use crate::utils::coding;
 
 type RefTableCache = Rc<RefCell<TableCache>>;
 
-#[derive(Clone, Eq)]
 pub struct FileMetaData {
-    refs: Cell<u32>,
-    pub allowed_seeks: Cell<i32>,
+    refs: AtomicU32,
+    pub allowed_seeks: AtomicI32,
     pub number: u64,
     pub file_size: u64,
     pub smallest: InternalKey,
@@ -34,12 +35,25 @@ impl FileMetaData {
 impl Default for FileMetaData {
     fn default() -> Self {
         Self {
-            refs: Cell::new(0),
-            allowed_seeks: Cell::new(1 << 30),
+            refs: AtomicU32::new(0),
+            allowed_seeks: AtomicI32::new(1 << 30),
             number: 0,
             file_size: 0,
             smallest: InternalKey::default(),
             largest: InternalKey::default(),
+        }
+    }
+}
+
+impl Clone for FileMetaData {
+    fn clone(&self) -> Self {
+        Self {
+            refs: AtomicU32::new(self.refs.load(std::sync::atomic::Ordering::Relaxed)),
+            allowed_seeks: AtomicI32::new(self.allowed_seeks.load(std::sync::atomic::Ordering::Relaxed)),
+            number: self.number,
+            file_size: self.file_size,
+            smallest: self.smallest.clone(),
+            largest: self.largest.clone(),
         }
     }
 }
@@ -49,6 +63,8 @@ impl PartialEq for FileMetaData {
         self.number == other.number && self.smallest == other.smallest
     }
 }
+
+impl Eq for FileMetaData {}
 
 impl PartialOrd for FileMetaData {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -163,13 +179,11 @@ impl Version {
 
     pub fn update_statistics(&self, stats: &GetStatistics) -> bool {
         if let Some(file) = &stats.seek_file {
-            let mut count = file.allowed_seeks.get();
-            count -= 1;
-            if count <= 0 && self.file_to_compact.borrow().is_none() {
+            let count = file.allowed_seeks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if count - 1 <= 0 && self.file_to_compact.borrow().is_none() {
                 self.file_to_compact_level.set(stats.seek_file_level);
                 self.file_to_compact.replace(Some(file.clone()));
             }
-            file.allowed_seeks.set(count);
             return true;
         }
         false
@@ -658,12 +672,13 @@ impl<'a> VersionBuilder<'a> {
 
         for (level, meta) in &edit.new_files {
             let mut file_meta = meta.clone();
-            file_meta.refs = Cell::new(1);
-            file_meta.allowed_seeks.set((file_meta.file_size / 16384) as i32);
-            if file_meta.allowed_seeks.get() < 100 {
-                file_meta.allowed_seeks.set(100);
-            }
+            file_meta.refs = AtomicU32::new(1);
 
+            let mut count = (file_meta.file_size / 16384) as i32;
+            if count < 100 {
+                count = 100;
+            }
+            file_meta.allowed_seeks.store(count, std::sync::atomic::Ordering::Relaxed);
             self.levels[*level].deleted_files.remove(&file_meta.number);
             self.levels[*level].added_files.insert(Rc::new(file_meta));
         }
@@ -701,7 +716,7 @@ impl<'a> VersionBuilder<'a> {
             let ref mut file_metas = version.files[level];
             if level > 0 && !file_metas.is_empty() {}
 
-            meta.refs.set(meta.refs.get() + 1);
+            meta.refs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             file_metas.push(meta);
         }
     }
