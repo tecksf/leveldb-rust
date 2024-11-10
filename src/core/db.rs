@@ -75,7 +75,7 @@ impl Database {
         let mut write_ahead_logger = db_impl.write_ahead_logger.take();
         let mut last_sequence = db_impl.versions.get_last_sequence();
         let mutable = db_impl.mutable.clone();
-        let result = db_impl.make_room_for_write(false, self.db_impl.clone());
+        let mut result = db_impl.make_room_for_write(false, self.db_impl.clone());
 
         drop(db_impl);
 
@@ -83,13 +83,17 @@ impl Database {
             write_batch.set_sequence(last_sequence + 1);
             last_sequence += write_batch.get_count() as u64;
 
-            if let Some(logger) = &mut write_ahead_logger {
-                logger.add_record(write_batch.get_payload())?;
-                if options.sync {
-                    logger.sync()?;
+            result = match &mut write_ahead_logger {
+                Some(logger) => {
+                    logger.add_record(write_batch.get_payload())?;
+                    if options.sync {
+                        logger.sync()?;
+                    }
+                    mutable.insert(&write_batch);
+                    Ok(())
                 }
-                mutable.insert(&write_batch);
-            }
+                _ => Ok(())
+            };
         }
 
         let mut db_impl = self.db_impl.lock();
@@ -409,7 +413,7 @@ impl DatabaseImpl {
     }
 
     fn maybe_schedule_compaction(&mut self, database: Arc<Mutex<Self>>) {
-        self.dispatcher.dispatch(Box::new(||{
+        self.dispatcher.dispatch(Box::new(|| {
             Self::background_compaction(database);
         }));
     }
