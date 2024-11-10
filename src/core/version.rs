@@ -737,14 +737,14 @@ pub struct VersionSet {
     options: Options,
     versions: VecDeque<Arc<Version>>,
     current: Arc<Version>,
-    next_file_number: Cell<u64>,
-    last_sequence: Cell<u64>,
+    next_file_number: u64,
+    last_sequence: u64,
     log_number: u64,
     prev_log_number: u64,
     manifest_file_number: u64,
     manifest_logger: Option<wal::Writer<file::WritableFile>>,
     compact_pointers: [InternalKey; logs::NUM_LEVELS],
-    table_cache: RefTableCache,
+    // table_cache: RefTableCache,
 }
 
 impl VersionSet {
@@ -754,14 +754,14 @@ impl VersionSet {
             options,
             versions: VecDeque::new(),
             current: Arc::new(Version::new()),
-            next_file_number: Cell::new(2),
-            last_sequence: Cell::new(0),
+            next_file_number: 2,
+            last_sequence: 0,
             log_number: 0,
             prev_log_number: 0,
             manifest_file_number: 0,
             manifest_logger: None,
             compact_pointers: Default::default(),
-            table_cache: Rc::new(RefCell::new(TableCache::new(db_name, options))),
+            // table_cache: Rc::new(RefCell::new(TableCache::new(db_name, options))),
         };
         set.versions.push_back(set.current.clone());
         set
@@ -771,16 +771,16 @@ impl VersionSet {
         let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
         let version = self.latest_version();
         let seek_cache = |file: Arc<FileMetaData>| {
-            let mut table_cache = self.table_cache.borrow_mut();
-            match table_cache.get(file.number, file.file_size, internal_key) {
-                Ok(table_result) => {
-                    if let Some(value) = table_result {
-                        result = Ok(value);
-                    };
-                    return true;
-                }
-                Err(err) => result = Err(err),
-            };
+            // let mut table_cache = self.table_cache.borrow_mut();
+            // match table_cache.get(file.number, file.file_size, internal_key) {
+            //     Ok(table_result) => {
+            //         if let Some(value) = table_result {
+            //             result = Ok(value);
+            //         };
+            //         return true;
+            //     }
+            //     Err(err) => result = Err(err),
+            // };
             false
         };
 
@@ -796,18 +796,18 @@ impl VersionSet {
         self.current.files[level as usize].len()
     }
 
-    pub fn get_new_file_number(&self) -> u64 {
-        let number = self.next_file_number.get();
-        self.next_file_number.set(number + 1);
+    pub fn get_new_file_number(&mut self) -> u64 {
+        let number = self.next_file_number;
+        self.next_file_number = number + 1;
         number
     }
 
     pub fn get_last_sequence(&self) -> u64 {
-        self.last_sequence.get()
+        self.last_sequence
     }
 
-    pub fn set_last_sequence(&self, sequence: u64) {
-        self.last_sequence.set(sequence)
+    pub fn set_last_sequence(&mut self, sequence: u64) {
+        self.last_sequence = sequence
     }
 
     pub fn get_log_number(&self) -> u64 {
@@ -822,15 +822,15 @@ impl VersionSet {
         self.manifest_file_number
     }
 
-    pub fn mark_file_number_used(&self, number: u64) {
-        if self.next_file_number.get() <= number {
-            self.next_file_number.set(number + 1);
+    pub fn mark_file_number_used(&mut self, number: u64) {
+        if self.next_file_number <= number {
+            self.next_file_number = number + 1;
         }
     }
 
-    pub fn reuse_file_number(&self, number: u64) {
-        if self.next_file_number.get() == number + 1 {
-            self.next_file_number.set(number);
+    pub fn reuse_file_number(&mut self, number: u64) {
+        if self.next_file_number == number + 1 {
+            self.next_file_number = number;
         }
     }
 
@@ -843,8 +843,8 @@ impl VersionSet {
             edit.set_prev_log_number(self.prev_log_number);
         }
 
-        edit.set_next_file_number(self.next_file_number.get());
-        edit.set_last_sequence(self.last_sequence.get());
+        edit.set_next_file_number(self.next_file_number);
+        edit.set_last_sequence(self.last_sequence);
 
         // let handle_compact_pointers = |level: usize, internal_key: &Vec<u8>| {
         //     self.compact_pointers[level] = internal_key.clone();
@@ -935,8 +935,8 @@ impl VersionSet {
         self.append_version(version);
 
         self.manifest_file_number = next_file_number.unwrap_or(0);
-        self.next_file_number.set(self.manifest_file_number + 1);
-        self.last_sequence.set(last_sequence.unwrap_or(0));
+        self.next_file_number = self.manifest_file_number + 1;
+        self.last_sequence = last_sequence.unwrap_or(0);
         self.log_number = log_number.unwrap_or(0);
         self.prev_log_number = prev_log_numer.unwrap_or(0);
 
@@ -1151,17 +1151,17 @@ impl VersionSet {
 
             if compaction.level + level == 0 {
                 for file in &compaction.inputs[level] {
-                    let table_iter = self.table_cache.borrow_mut().iter(file.number, file.file_size);
-                    if let Some(iter) = table_iter {
-                        iterator_list.push(iter);
-                    }
+                    // let table_iter = self.table_cache.borrow_mut().iter(file.number, file.file_size);
+                    // if let Some(iter) = table_iter {
+                    //     iterator_list.push(iter);
+                    // }
                 }
             } else {
-                let iter = TwoLevelIterator::new(
-                    VersionLevelFileIterator::new(compaction.inputs[level].clone()),
-                    FileIteratorGen::new(self.table_cache.clone()),
-                );
-                iterator_list.push(Box::new(iter));
+                // let iter = TwoLevelIterator::new(
+                //     VersionLevelFileIterator::new(compaction.inputs[level].clone()),
+                //     FileIteratorGen::new(self.table_cache.clone()),
+                // );
+                // iterator_list.push(Box::new(iter));
             }
         }
 

@@ -1,57 +1,217 @@
 use std::{fs, io, thread, time};
-use std::cell::{Cell, RefCell};
 use std::collections::LinkedList;
 use std::ffi::OsString;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
+use crossbeam_channel::internal::SelectHandle;
 use parking_lot::{Mutex, Condvar};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
 use crate::core::format::{Comparator, InternalKey, LookupKey};
 use crate::core::memory::MemoryTable;
-use crate::core::schedule::Dispatcher;
+use crate::core::schedule;
 use crate::core::sst::build_table;
 use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
 
-struct Producer {
+struct Agent {
     batch: WriteBatch,
     sync: bool,
-    done: Cell<bool>,
     cond: Condvar,
-    result: Cell<io::Result<()>>,
+    result_sender: crossbeam_channel::Sender<io::Result<()>>,
+    result_receiver: crossbeam_channel::Receiver<io::Result<()>>,
 }
 
+#[derive(Clone)]
 pub struct Database {
-    name: String,
-    options: Options,
-    log_file_number: u64,
-    write_ahead_logger: Option<wal::Writer<WritableFile>>,
-    mutable: MemoryTable,
-    immutable: Option<MemoryTable>,
-    versions: VersionSet,
-    producers: Mutex<LinkedList<Rc<Producer>>>,
-    dispatcher: Dispatcher,
+    db_impl: Arc<Mutex<DatabaseImpl>>,
 }
 
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
-        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
-        log::info!("Opening database at path: {}", path.as_ref());
+        Ok(Self {
+            db_impl: Arc::new(Mutex::new(DatabaseImpl::new(path.as_ref(), options)?)),
+        })
+    }
 
-        let mut db = Database {
-            name: String::from(path.as_ref()),
+    pub fn put<T: AsRef<str>>(&self, options: WriteOptions, key: T, value: T) -> io::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write(options, batch)
+    }
+
+    pub fn delete<T: AsRef<str>>(&self, options: WriteOptions, key: T) -> io::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write(options, batch)
+    }
+
+    pub fn write(&self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let current_agent = Arc::new(Agent {
+            batch,
+            sync: options.sync,
+            cond: Condvar::new(),
+            result_sender: tx,
+            result_receiver: rx,
+        });
+
+        let mut db_impl = self.db_impl.lock();
+        db_impl.agents.push_back(current_agent.clone());
+        while current_agent.result_receiver.is_empty() && !Arc::ptr_eq(&current_agent, &db_impl.agents.front().unwrap().clone()) {
+            current_agent.cond.wait(&mut db_impl);
+        }
+
+        if current_agent.result_receiver.is_ready() {
+            return current_agent.result_receiver.recv().unwrap();
+        }
+
+        let mut write_batch = WriteBatch::new();
+        let last_agent = Self::build_batch_group(&db_impl.agents, &mut write_batch);
+
+        let mut write_ahead_logger = db_impl.write_ahead_logger.take();
+        let mut last_sequence = db_impl.versions.get_last_sequence();
+        let mutable = db_impl.mutable.clone();
+        let result = db_impl.make_room_for_write(false, self.db_impl.clone());
+
+        drop(db_impl);
+
+        if result.is_ok() {
+            write_batch.set_sequence(last_sequence + 1);
+            last_sequence += write_batch.get_count() as u64;
+
+            if let Some(logger) = &mut write_ahead_logger {
+                logger.add_record(write_batch.get_payload())?;
+                if options.sync {
+                    logger.sync()?;
+                }
+                mutable.insert(&write_batch);
+            }
+        }
+
+        let mut db_impl = self.db_impl.lock();
+        db_impl.versions.set_last_sequence(last_sequence);
+        while let Some(ready_agent) = db_impl.agents.pop_front() {
+            if !Arc::ptr_eq(&ready_agent, &current_agent) {
+                let agent_result = match &result {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(io::Error::new(err.kind(), err.to_string()))
+                };
+                ready_agent.result_sender.send(agent_result).unwrap();
+                ready_agent.cond.notify_one();
+            }
+
+            if Arc::ptr_eq(&ready_agent, &last_agent) {
+                break;
+            }
+        }
+
+        if let Some(agent) = db_impl.agents.front() {
+            agent.cond.notify_one();
+        }
+
+        result
+    }
+
+    pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
+        let db_impl = self.db_impl.lock();
+        let sequence = db_impl.versions.get_last_sequence();
+        let mutable = db_impl.mutable.clone();
+        let immutable = db_impl.immutable.clone();
+
+        drop(db_impl);
+
+        let lookup_key = LookupKey::new(key.as_ref(), sequence);
+        let not_found: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
+
+        if let Ok(result) = mutable.get(&lookup_key) {
+            return match result {
+                Some(value) => Ok(value),
+                _ => not_found,
+            };
+        }
+
+        if let Some(table) = &immutable {
+            if let Ok(result) = table.get(&lookup_key) {
+                return match result {
+                    Some(value) => Ok(value),
+                    _ => not_found,
+                };
+            }
+        }
+
+        let db_impl = self.db_impl.lock();
+        let internal_key = lookup_key.extract_internal_key();
+        let (result, has_stats_update) = db_impl.versions.get(&internal_key);
+        if has_stats_update {
+            // self.maybe_schedule_compaction();
+        }
+
+        result
+    }
+
+    fn build_batch_group(agents: &LinkedList<Arc<Agent>>, result: &mut WriteBatch) -> Arc<Agent> {
+        let first = agents.front().unwrap().clone();
+        let mut last = first.clone();
+
+        result.extend(&first.batch);
+
+        let mut size = first.batch.size();
+        let mut max_size: usize = 1 << 20;
+        if size <= (128 << 10) {
+            max_size = size + (128 << 10);
+        }
+
+        let mut it = agents.iter();
+        it.next();
+        while let Some(p) = it.next() {
+            if p.sync && !first.sync {
+                break;
+            }
+
+            size += p.batch.size();
+            if size > max_size {
+                break;
+            }
+
+            last = p.clone();
+            result.extend(&p.batch);
+        }
+
+        last
+    }
+}
+
+struct DatabaseImpl {
+    name: String,
+    options: Options,
+    log_file_number: u64,
+    write_ahead_logger: Option<wal::Writer<WritableFile>>,
+    mutable: Arc<MemoryTable>,
+    immutable: Option<Arc<MemoryTable>>,
+    versions: VersionSet,
+    dispatcher: schedule::Dispatcher,
+    agents: LinkedList<Arc<Agent>>,
+}
+
+impl DatabaseImpl {
+    pub fn new(path: &str, options: Options) -> io::Result<Self> {
+        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        log::info!("Opening database at path: {}", path);
+
+        let mut db = DatabaseImpl {
+            name: String::from(path),
             options,
-            log_file_number: 0,
             write_ahead_logger: None,
-            mutable: MemoryTable::new(),
+            log_file_number: 0,
+            mutable: Arc::new(MemoryTable::new()),
             immutable: None,
-            versions: VersionSet::new(path.as_ref(), options),
-            producers: Mutex::new(LinkedList::new()),
-            dispatcher: Dispatcher::new(),
+            versions: VersionSet::new(path, options),
+            dispatcher: schedule::Dispatcher::new(),
+            agents: LinkedList::new(),
         };
 
         db.init()?;
@@ -80,146 +240,7 @@ impl Database {
         Ok(db)
     }
 
-    pub fn put<T: AsRef<str>>(&mut self, options: WriteOptions, key: T, value: T) -> io::Result<()> {
-        let mut batch = WriteBatch::new();
-        batch.put(key, value);
-        self.write(options, batch)
-    }
-
-    pub fn delete<T: AsRef<str>>(&mut self, options: WriteOptions, key: T) -> io::Result<()> {
-        let mut batch = WriteBatch::new();
-        batch.delete(key);
-        self.write(options, batch)
-    }
-
-    pub fn write(&mut self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
-        let producer = Rc::new(Producer {
-            batch,
-            sync: options.sync,
-            done: Cell::new(false),
-            cond: Condvar::new(),
-            result: Cell::new(Ok(())),
-        });
-
-        {
-            let mut producers = self.producers.lock();
-            producers.push_back(producer.clone());
-            while !producer.done.get() && !Rc::ptr_eq(&producer, &producers.front().unwrap().clone()) {
-                producer.cond.wait(&mut producers);
-            }
-
-            if producer.done.get() {
-                return producer.result.replace(Ok(()));
-            }
-        }
-
-        let mut last_sequence = self.versions.get_last_sequence();
-        let mut last_producer = producer.clone();
-        let mut write_batch = WriteBatch::new();
-
-        let result = self.make_room_for_write(false);
-        if result.is_ok() {
-            last_producer = self.build_batch_group(&mut write_batch);
-            write_batch.set_sequence(last_sequence + 1);
-            last_sequence += write_batch.get_count() as u64;
-
-            if let Some(logger) = &mut self.write_ahead_logger {
-                logger.add_record(write_batch.get_payload())?;
-                if options.sync {
-                    logger.sync()?;
-                }
-                self.mutable.insert(&write_batch);
-            }
-            self.versions.set_last_sequence(last_sequence);
-        }
-
-        {
-            let mut producers = self.producers.lock();
-            while let Some(ready) = producers.pop_front() {
-                if !Rc::ptr_eq(&ready, &producer) {
-                    ready.done.set(true);
-                    ready.cond.notify_one();
-                    if let Err(err) = &result {
-                        ready.result.set(Err(io::Error::new(err.kind(), err.to_string())));
-                    }
-                }
-
-                if Rc::ptr_eq(&ready, &last_producer) {
-                    break;
-                }
-            }
-
-            if !producers.is_empty() {
-                producers.front().unwrap().cond.notify_one();
-            }
-        }
-
-        result
-    }
-
-    pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
-        let sequence = self.versions.get_last_sequence();
-        let lookup_key = LookupKey::new(key.as_ref(), sequence);
-        let not_found: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
-
-        if let Ok(result) = self.mutable.get(&lookup_key) {
-            return match result {
-                Some(value) => Ok(value),
-                _ => not_found,
-            };
-        }
-
-        if let Some(table) = &self.immutable {
-            if let Ok(result) = table.get(&lookup_key) {
-                return match result {
-                    Some(value) => Ok(value),
-                    _ => not_found,
-                };
-            }
-        }
-
-        let internal_key = lookup_key.extract_internal_key();
-        let (result, has_stats_update) = self.versions.get(&internal_key);
-        if has_stats_update {
-            // self.maybe_schedule_compaction();
-        }
-
-        result
-    }
-
-    fn build_batch_group(&self, result: &mut WriteBatch) -> Rc<Producer> {
-        let producers = self.producers.lock();
-        let first = producers.front().unwrap().clone();
-        let mut last = first.clone();
-
-        result.extend(&first.batch);
-
-        let mut size = first.batch.size();
-        let mut max_size: usize = 1 << 20;
-        if size <= (128 << 10) {
-            max_size = size + (128 << 10);
-        }
-
-        let mut it = producers.iter();
-        it.next();
-        while let Some(p) = it.next() {
-            if p.sync && !first.sync {
-                break;
-            }
-
-            size += p.batch.size();
-            if size > max_size {
-                break;
-            }
-
-            last = p.clone();
-            result.extend(&p.batch);
-        }
-
-        last
-    }
-
-    fn make_room_for_write(&mut self, force: bool) -> io::Result<()> {
+    fn make_room_for_write(&mut self, force: bool, database: Arc<Mutex<Self>>) -> io::Result<()> {
         let mut allow_delay = !force;
         loop {
             if allow_delay && self.versions.num_level_files(0) >= logs::L0_SLOW_DOWN_WRITES_TRIGGER {
@@ -246,9 +267,9 @@ impl Database {
                     }
                 }
 
-                let immutable = std::mem::replace(&mut self.mutable, MemoryTable::new());
-                self.immutable = Some(immutable);
-                self.maybe_schedule_compaction();
+                self.immutable = Some(self.mutable.clone());
+                self.mutable = Arc::new(MemoryTable::new());
+                self.maybe_schedule_compaction(database.clone());
             }
         }
         Ok(())
@@ -347,7 +368,7 @@ impl Database {
         let reader = wal::Reader::new(file::ReadableFile::open(&log_file_name)?);
         let mut max_sequence: u64 = 0;
         let mut compactions = 0;
-        let mut new_table = MemoryTable::new();
+        let mut new_table = Arc::new(MemoryTable::new());
 
         while let Some(record) = reader.read_record() {
             if record.len() < 12 {
@@ -365,10 +386,10 @@ impl Database {
             if new_table.memory_usage() > self.options.write_buffer_size {
                 compactions += 1;
                 let new_number = self.versions.get_new_file_number();
-                let (level, file_meta) = self.write_level0_table(None, new_number, &new_table)?;
+                let (level, file_meta) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
                 edit.add_file(level, file_meta);
 
-                new_table = MemoryTable::new();
+                new_table = Arc::new(MemoryTable::new());
             }
         }
 
@@ -379,66 +400,76 @@ impl Database {
 
         if new_table.memory_usage() > 0 {
             let new_number = self.versions.get_new_file_number();
-            let (level, file_meta) = self.write_level0_table(None, new_number, &new_table)?;
+            let (level, file_meta) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
             edit.add_file(level, file_meta);
         }
 
         Ok(max_sequence)
     }
 
-    fn maybe_schedule_compaction(&mut self) {
-        self.compact_memory_table();
+    fn maybe_schedule_compaction(&mut self, database: Arc<Mutex<Self>>) {
+        self.dispatcher.dispatch(Box::new(||{
+            Self::background_compaction(database);
+        }));
     }
 
-    fn background_compaction(&mut self) {
-        if self.immutable.is_some() {
-            self.compact_memory_table();
+    fn background_compaction(database: Arc<Mutex<Self>>) {
+        if database.lock().immutable.is_some() {
+            Self::compact_memory_table(database);
             return;
         }
 
-        if let Some(mut compaction) = self.versions.pick_compaction() {
+        let mut db = database.lock();
+        if let Some(mut compaction) = db.versions.pick_compaction() {
             if compaction.is_trivial_move() {
                 let level = compaction.level;
                 let file = compaction.inputs[0][0].clone();
                 compaction.edit.remove_file(level, file.number);
                 compaction.edit.add_file(level + 1, file.as_ref().clone());
-                self.versions.log_and_apply(compaction.edit).unwrap();
-                log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, self.versions.level_summary());
+                db.versions.log_and_apply(compaction.edit).unwrap();
+                log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, db.versions.level_summary());
             } else {
-                self.do_compaction_work();
+                db.do_compaction_work();
             }
         }
     }
 
     fn do_compaction_work(&self) {}
 
-    fn compact_memory_table(&mut self) {
-        let base = self.versions.latest_version();
-        let file_number = self.versions.get_new_file_number();
+    fn compact_memory_table(database: Arc<Mutex<Self>>) {
+        let mut db = database.lock();
+        let table = db.immutable.as_ref().unwrap().clone();
+        let base = db.versions.latest_version();
+        let file_number = db.versions.get_new_file_number();
+        let options = db.options;
+        let db_name = String::from(db.name.as_str());
+        let log_file_number = db.log_file_number;
 
-        if let Some(table) = &self.immutable {
-            let result = self.write_level0_table(Some(&base), file_number, table);
-            if result.is_err() {
-                return;
-            }
+        drop(db);
 
-            let (level, meta) = result.unwrap();
-            let mut edit = VersionEdit::new();
-            edit.set_prev_log_number(0);
-            edit.set_log_number(self.log_file_number);
-            edit.add_file(level, meta);
-            let status = self.versions.log_and_apply(edit);
-            if status.is_ok() {
-                self.immutable = None;
-                self.remove_obsolete_files();
-            }
+        let result = Self::write_level0_table(options, db_name.as_str(), Some(&base), file_number, &table);
+        if result.is_err() {
+            return;
+        }
+
+        let (level, meta) = result.unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_prev_log_number(0);
+        edit.set_log_number(log_file_number);
+        edit.add_file(level, meta);
+
+        let mut db = database.lock();
+        let status = db.versions.log_and_apply(edit);
+        if status.is_ok() {
+            db.immutable = None;
+            db.remove_obsolete_files();
         }
     }
 
-    fn write_level0_table(&self, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData)> {
+    fn write_level0_table(options: Options, db_name: &str, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData)> {
         log::info!("level-0 table {}:started", file_number);
 
-        let meta = build_table(self.options, self.name.as_str(), table.iter(), file_number)?;
+        let meta = build_table(options, db_name, table.iter(), file_number)?;
 
         log::info!("level-0 table {}: {} bytes", file_number, meta.file_size);
 

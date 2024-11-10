@@ -167,6 +167,9 @@ pub struct MemoryTable {
     refs: Cell<u32>,
 }
 
+unsafe impl Send for MemoryTable {}
+unsafe impl Sync for MemoryTable {}
+
 impl MemoryTable {
     pub fn new() -> Self {
         Self {
