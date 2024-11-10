@@ -94,6 +94,7 @@ impl Database {
 
         let mut db_impl = self.db_impl.lock();
         db_impl.versions.set_last_sequence(last_sequence);
+        db_impl.write_ahead_logger = write_ahead_logger;
         while let Some(ready_agent) = db_impl.agents.pop_front() {
             if !Arc::ptr_eq(&ready_agent, &current_agent) {
                 let agent_result = match &result {
