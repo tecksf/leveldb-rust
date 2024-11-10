@@ -1,68 +1,81 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::AtomicBool;
 use std::thread;
 
 pub type Task = Box<dyn FnOnce() + Send>;
 
-pub struct Dispatcher {
-    tasks: Arc<Mutex<VecDeque<Task>>>,
+struct Cron {
+    tasks: VecDeque<Task>,
     background_thread: Option<thread::JoinHandle<()>>,
+    alive: bool,
+}
+
+#[derive(Clone)]
+pub struct Dispatcher {
+    cron: Arc<Mutex<Cron>>,
     background_thread_cv: Arc<Condvar>,
-    alive: Arc<AtomicBool>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(VecDeque::new())),
+            cron: Arc::new(Mutex::new(Cron {
+                tasks: VecDeque::new(),
+                background_thread: None,
+                alive: true,
+            })),
             background_thread_cv: Arc::new(Condvar::new()),
-            background_thread: None,
-            alive: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn dispatch(&mut self, task: Task) {
-        let mut tasks = self.tasks.lock().unwrap();
+    pub fn dispatch(&self, task: Task) {
+        let mut cron = self.cron.lock().unwrap();
 
-        if self.background_thread.is_none() {
-            self.alive.store(true, std::sync::atomic::Ordering::Relaxed);
-            let tasks = self.tasks.clone();
-            let background_thread_cv = self.background_thread_cv.clone();
-            let alive = self.alive.clone();
-            self.background_thread = Some(thread::spawn(
-                move || Self::background_entry(tasks, background_thread_cv, alive)
+        if !cron.alive {
+            return;
+        }
+
+        if cron.background_thread.is_none() {
+            let cron_clone = self.cron.clone();
+            let cv = self.background_thread_cv.clone();
+            cron.background_thread = Some(thread::spawn(
+                move || Self::background_entry(cron_clone, cv)
             ));
         }
 
-        if tasks.is_empty() {
+        if cron.tasks.is_empty() {
             self.background_thread_cv.notify_one();
         }
 
-        tasks.push_back(task);
+        cron.tasks.push_back(task);
     }
 
-    pub fn terminate(&mut self) {
-        self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    pub fn terminate(&self) {
+        let background_thread;
+        {
+            let mut cron = self.cron.lock().unwrap();
+            cron.alive = false;
+            background_thread = cron.background_thread.take();
+        }
         self.background_thread_cv.notify_one();
-        if let Some(handle) = self.background_thread.take() {
+        if let Some(handle) = background_thread {
             handle.join().unwrap();
         }
     }
 
-    fn background_entry(tasks: Arc<Mutex<VecDeque<Task>>>, background_thread_cv: Arc<Condvar>, alive: Arc<AtomicBool>) {
-        while alive.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut tasks = tasks.lock().unwrap();
-
-            while tasks.is_empty() {
-                tasks = background_thread_cv.wait(tasks).unwrap();
-                if !alive.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
+    fn background_entry(cron_: Arc<Mutex<Cron>>, background_thread_cv: Arc<Condvar>) {
+        loop {
+            let mut cron = cron_.lock().unwrap();
+            while cron.alive && cron.tasks.is_empty() {
+                cron = background_thread_cv.wait(cron).unwrap();
             }
 
-            let task = tasks.pop_front().unwrap();
-            drop(tasks);
+            if !cron.alive {
+                break;
+            }
+
+            let task = cron.tasks.pop_front().unwrap();
+            drop(cron);
             task();
         }
     }
@@ -88,7 +101,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         dispatcher.terminate();
         assert_eq!(*result.lock().unwrap(), 100);
-        assert!(dispatcher.background_thread.is_none());
-        assert!(!dispatcher.alive.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(dispatcher.cron.lock().unwrap().background_thread.is_none());
+        assert!(!dispatcher.cron.lock().unwrap().alive);
     }
 }

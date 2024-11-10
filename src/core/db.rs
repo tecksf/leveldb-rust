@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
 use crossbeam_channel::internal::SelectHandle;
-use parking_lot::{Mutex, Condvar};
+use parking_lot::{Mutex, Condvar, MutexGuard};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
@@ -28,12 +28,16 @@ struct Agent {
 #[derive(Clone)]
 pub struct Database {
     db_impl: Arc<Mutex<DatabaseImpl>>,
+    dispatcher: schedule::Dispatcher,
+    background_work_finished_signal: Arc<Condvar>,
 }
 
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
         Ok(Self {
             db_impl: Arc::new(Mutex::new(DatabaseImpl::new(path.as_ref(), options)?)),
+            dispatcher: schedule::Dispatcher::new(),
+            background_work_finished_signal: Arc::new(Condvar::new()),
         })
     }
 
@@ -75,7 +79,7 @@ impl Database {
         let mut write_ahead_logger = db_impl.write_ahead_logger.take();
         let mut last_sequence = db_impl.versions.get_last_sequence();
         let mutable = db_impl.mutable.clone();
-        let mut result = db_impl.make_room_for_write(false, self.db_impl.clone());
+        let mut result = self.make_room_for_write(&mut db_impl, false);
 
         drop(db_impl);
 
@@ -188,6 +192,51 @@ impl Database {
 
         last
     }
+
+    fn make_room_for_write(&self, mut database: &mut MutexGuard<DatabaseImpl>, force: bool) -> io::Result<()> {
+        let mut allow_delay = !force;
+        loop {
+            if allow_delay && database.versions.num_level_files(0) >= logs::L0_SLOW_DOWN_WRITES_TRIGGER {
+                thread::sleep(time::Duration::from_millis(1));
+                allow_delay = false;
+            } else if database.mutable.memory_usage() <= database.options.write_buffer_size {
+                break;
+            } else if database.immutable.is_some() {
+                log::info!("current memory table is full, waiting...\n");
+                self.background_work_finished_signal.wait(&mut database);
+            } else if database.versions.num_level_files(0) >= logs::L0_STOP_WRITES_TRIGGER {
+                log::info!("too many L0 files, waiting...\n");
+                self.background_work_finished_signal.wait(&mut database);
+            } else {
+                let new_log_number = database.versions.get_new_file_number();
+                let status = WritableFile::open(filename::make_log_file_name(database.name.as_str(), new_log_number));
+                match status {
+                    Ok(file) => {
+                        database.log_file_number = new_log_number;
+                        database.write_ahead_logger = Some(wal::Writer::new(file));
+                    }
+                    Err(reason) => {
+                        log::error!("cannot create new WAL: {}", reason);
+                        database.versions.reuse_file_number(new_log_number);
+                        return Err(reason);
+                    }
+                }
+
+                database.immutable = Some(database.mutable.clone());
+                database.mutable = Arc::new(MemoryTable::new());
+                self.maybe_schedule_compaction(self.db_impl.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_schedule_compaction(&self, database: Arc<Mutex<DatabaseImpl>>) {
+        let background_work_finished_signal = self.background_work_finished_signal.clone();
+        self.dispatcher.dispatch(Box::new(move || {
+            DatabaseImpl::background_compaction(database);
+            background_work_finished_signal.notify_all();
+        }));
+    }
 }
 
 struct DatabaseImpl {
@@ -198,7 +247,6 @@ struct DatabaseImpl {
     mutable: Arc<MemoryTable>,
     immutable: Option<Arc<MemoryTable>>,
     versions: VersionSet,
-    dispatcher: schedule::Dispatcher,
     agents: LinkedList<Arc<Agent>>,
 }
 
@@ -215,7 +263,6 @@ impl DatabaseImpl {
             mutable: Arc::new(MemoryTable::new()),
             immutable: None,
             versions: VersionSet::new(path, options),
-            dispatcher: schedule::Dispatcher::new(),
             agents: LinkedList::new(),
         };
 
@@ -243,41 +290,6 @@ impl DatabaseImpl {
         db.remove_obsolete_files();
 
         Ok(db)
-    }
-
-    fn make_room_for_write(&mut self, force: bool, database: Arc<Mutex<Self>>) -> io::Result<()> {
-        let mut allow_delay = !force;
-        loop {
-            if allow_delay && self.versions.num_level_files(0) >= logs::L0_SLOW_DOWN_WRITES_TRIGGER {
-                thread::sleep(time::Duration::from_millis(1));
-                allow_delay = false;
-            } else if self.mutable.memory_usage() <= self.options.write_buffer_size {
-                break;
-            } else if self.immutable.is_some() {
-                log::info!("current memory table is full, waiting...\n");
-            } else if self.versions.num_level_files(0) >= logs::L0_STOP_WRITES_TRIGGER {
-                log::info!("too many L0 files, waiting...\n");
-            } else {
-                let new_log_number = self.versions.get_new_file_number();
-                let status = WritableFile::open(filename::make_log_file_name(self.name.as_str(), new_log_number));
-                match status {
-                    Ok(file) => {
-                        self.log_file_number = new_log_number;
-                        self.write_ahead_logger = Some(wal::Writer::new(file));
-                    }
-                    Err(reason) => {
-                        log::error!("cannot create new WAL: {}", reason);
-                        self.versions.reuse_file_number(new_log_number);
-                        return Err(reason);
-                    }
-                }
-
-                self.immutable = Some(self.mutable.clone());
-                self.mutable = Arc::new(MemoryTable::new());
-                self.maybe_schedule_compaction(database.clone());
-            }
-        }
-        Ok(())
     }
 
     fn init(&self) -> io::Result<()> {
@@ -410,12 +422,6 @@ impl DatabaseImpl {
         }
 
         Ok(max_sequence)
-    }
-
-    fn maybe_schedule_compaction(&mut self, database: Arc<Mutex<Self>>) {
-        self.dispatcher.dispatch(Box::new(|| {
-            Self::background_compaction(database);
-        }));
     }
 
     fn background_compaction(database: Arc<Mutex<Self>>) {
