@@ -156,7 +156,7 @@ impl Database {
         let internal_key = lookup_key.extract_internal_key();
         let (result, has_stats_update) = db_impl.versions.get(&internal_key);
         if has_stats_update {
-            // self.maybe_schedule_compaction();
+            self.maybe_schedule_compaction();
         }
 
         result
@@ -197,8 +197,8 @@ impl Database {
         let mut allow_delay = !force;
         loop {
             if allow_delay && database.versions.num_level_files(0) >= logs::L0_SLOW_DOWN_WRITES_TRIGGER {
-                thread::sleep(time::Duration::from_millis(1));
                 allow_delay = false;
+                self.background_work_finished_signal.wait_for(&mut database, time::Duration::from_millis(1));
             } else if database.mutable.memory_usage() <= database.options.write_buffer_size {
                 break;
             } else if database.immutable.is_some() {
@@ -224,13 +224,14 @@ impl Database {
 
                 database.immutable = Some(database.mutable.clone());
                 database.mutable = Arc::new(MemoryTable::new());
-                self.maybe_schedule_compaction(self.db_impl.clone());
+                self.maybe_schedule_compaction();
             }
         }
         Ok(())
     }
 
-    fn maybe_schedule_compaction(&self, database: Arc<Mutex<DatabaseImpl>>) {
+    fn maybe_schedule_compaction(&self) {
+        let database = self.db_impl.clone();
         let background_work_finished_signal = self.background_work_finished_signal.clone();
         self.dispatcher.dispatch(Box::new(move || {
             DatabaseImpl::background_compaction(database);
