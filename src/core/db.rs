@@ -1,4 +1,4 @@
-use std::{fs, io, thread, time};
+use std::{fs, io, time};
 use std::collections::LinkedList;
 use std::ffi::OsString;
 use std::path::Path;
@@ -383,7 +383,7 @@ impl DatabaseImpl {
 
     fn recover_log_file(&mut self, log_number: u64, edit: &mut VersionEdit, last_file: bool) -> io::Result<u64> {
         let log_file_name = filename::make_log_file_name(self.name.as_ref(), log_number);
-        let reader = wal::Reader::new(file::ReadableFile::open(&log_file_name)?);
+        let mut reader = wal::Reader::new(file::ReadableFile::open(&log_file_name)?);
         let mut max_sequence: u64 = 0;
         let mut compactions = 0;
         let mut new_table = Arc::new(MemoryTable::new());

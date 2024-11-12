@@ -124,29 +124,29 @@ impl<T: WriterView> Writer<T> {
 
 pub struct Reader<T: ReaderView> {
     file: T,
-    buffer: RefCell<[u8; BLOCK_SIZE]>,
+    buffer: [u8; BLOCK_SIZE],
     buffer_room: Interval,
-    eof: Cell<bool>,
+    eof: bool,
 }
 
 impl<T: ReaderView> Reader<T> {
     pub fn new(file: T) -> Self {
         Self {
             file,
-            buffer: RefCell::new([0; BLOCK_SIZE]),
+            buffer: [0; BLOCK_SIZE],
             buffer_room: Interval::new(0, 0),
-            eof: Cell::new(false),
+            eof: false,
         }
     }
 
-    pub fn read_record(&self) -> Option<Vec<u8>> {
+    pub fn read_record(&mut self) -> Option<Vec<u8>> {
         let mut in_fragmented_record: bool = false;
         let mut full_record = Vec::<u8>::new();
 
         loop {
             let (record_type, interval) = self.read_physical_record();
             let (begin, end) = interval.get();
-            let fragment = &self.buffer.borrow()[begin..end];
+            let fragment = &self.buffer[begin..end];
 
             match record_type {
                 AdditionRecordType::RecordType(RecordType::Full) => {
@@ -191,19 +191,19 @@ impl<T: ReaderView> Reader<T> {
         Some(full_record)
     }
 
-    fn read_physical_record(&self) -> (AdditionRecordType, Interval) {
+    fn read_physical_record(&mut self) -> (AdditionRecordType, Interval) {
         while self.buffer_room.size() < RECORD_HEADER_SIZE {
-            if !self.eof.get() {
+            if !self.eof {
                 // last read was a full record, skip the rest trailer(0, 0,...)
-                match self.file.read(BLOCK_SIZE, self.buffer.borrow_mut().as_mut()) {
+                match self.file.read(BLOCK_SIZE, self.buffer.as_mut()) {
                     Ok(count) => {
                         self.buffer_room.set(0, count);
                         if count < BLOCK_SIZE {
-                            self.eof.set(true);
+                            self.eof = true;
                         }
                     }
                     _ => {
-                        self.eof.set(true);
+                        self.eof = true;
                         return (AdditionRecordType::Eof, Interval::default());
                     }
                 };
@@ -213,12 +213,12 @@ impl<T: ReaderView> Reader<T> {
         };
 
         let (begin, end) = self.buffer_room.get();
-        let record_header = &self.buffer.borrow()[begin..end][..RECORD_HEADER_SIZE];
+        let record_header = &self.buffer[begin..end][..RECORD_HEADER_SIZE];
         let record_length = ((record_header[4] & 0xff) as usize) | ((record_header[5] & 0xff) as usize) << 8;
         let record_type: RecordType = record_header[6].into();
         if RECORD_HEADER_SIZE + record_length > BLOCK_SIZE {
             self.buffer_room.clear();
-            let result = if self.eof.get() { AdditionRecordType::Eof } else { AdditionRecordType::BadRecord };
+            let result = if self.eof { AdditionRecordType::Eof } else { AdditionRecordType::BadRecord };
             return (result, Interval::default());
         }
 
@@ -228,7 +228,7 @@ impl<T: ReaderView> Reader<T> {
         }
 
         let expected_crc = coding::decode_fixed32(&record_header[..4]);
-        let actual_crc = crc32c::crc32c(&self.buffer.borrow()[begin + RECORD_HEADER_SIZE..begin + RECORD_HEADER_SIZE + record_length]);
+        let actual_crc = crc32c::crc32c(&self.buffer[begin + RECORD_HEADER_SIZE..begin + RECORD_HEADER_SIZE + record_length]);
         if expected_crc != actual_crc {
             self.buffer_room.clear();
             return (AdditionRecordType::BadRecord, Interval::default());
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!((length_high << 8) | r4[4] as u16, 9);
         assert_eq!(RecordType::from(r4[6]), RecordType::Last);
 
-        let reader = Reader::new(ReadableMemory::new(data.as_slice(), 0));
+        let mut reader = Reader::new(ReadableMemory::new(data.as_slice(), 0));
         assert_eq!(reader.read_record(), Some(Vec::from(message[0])));
         assert_eq!(reader.read_record(), Some(Vec::from(message[1])));
     }

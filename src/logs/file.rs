@@ -1,7 +1,7 @@
 use std::{fs, io};
-use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
+use std::os::windows::fs::FileExt;
 use crate::logs::filename;
 
 pub trait WriterView {
@@ -11,11 +11,11 @@ pub trait WriterView {
 }
 
 pub trait ReaderView {
-    fn read(&self, count: usize, buffer: &mut [u8]) -> io::Result<usize>;
+    fn read(&mut self, count: usize, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
 pub trait RandomReaderView {
-    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<()>;
+    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
 pub fn get_all_filenames(dir: &str) -> Vec<OsString> {
@@ -37,7 +37,7 @@ pub fn set_current_file(db_name: &str, manifest_number: u64) -> io::Result<()> {
 }
 
 pub struct WritableFile {
-    file_handle: fs::File,
+    file: fs::File,
 }
 
 impl WritableFile {
@@ -48,54 +48,58 @@ impl WritableFile {
             .append(true)
             .open(path.as_ref())?;
 
-        Ok(WritableFile { file_handle: file })
+        Ok(WritableFile { file })
     }
 }
 
 impl WriterView for WritableFile {
     fn append<T: AsRef<[u8]>>(&mut self, slice: T) -> io::Result<usize> {
-        self.file_handle.write(slice.as_ref())
+        self.file.write(slice.as_ref())
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.file_handle.sync_data()
+        self.file.sync_data()
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file_handle.flush()
+        self.file.flush()
     }
 }
 
 pub struct ReadableFile {
-    file_handle: RefCell<fs::File>,
+    file: fs::File,
 }
 
 impl ReadableFile {
     pub fn open<T: AsRef<OsStr>>(path: T) -> io::Result<Self> {
-        let file = fs::File::open(path.as_ref())?;
-        Ok(Self { file_handle: RefCell::new(file) })
+        Ok(Self { file: fs::File::open(path.as_ref())? })
     }
 }
 
 impl ReaderView for ReadableFile {
-    fn read(&self, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
         let buf = &mut buffer[..count];
-        self.file_handle.borrow_mut().read(buf)
+        self.file.read(buf)
     }
 }
 
 impl RandomReaderView for ReadableFile {
-    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<()> {
-        self.file_handle.borrow_mut().seek(SeekFrom::Start(offset))?;
+    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<(usize)> {
         let buf = &mut buffer[..count];
-        self.file_handle.borrow_mut().read_exact(buf)
+        #[cfg(windows)]
+        {
+            self.file.seek_read(buf, offset)
+        }
+        #[cfg(unix)]
+        {
+            self.file.read_exact_at(buf, offset)
+        }
     }
 }
 
 #[cfg(test)]
 pub mod tests {
     use std::io;
-    use std::cell::Cell;
     use super::{ReaderView, WriterView};
 
     pub struct WritableMemory<'a> {
@@ -123,25 +127,25 @@ pub mod tests {
 
     pub struct ReadableMemory<'a> {
         source: &'a [u8],
-        offset: Cell<usize>,
+        offset: usize,
     }
 
     impl<'a> ReadableMemory<'a> {
         pub fn new(data: &'a [u8], offset: usize) -> Self {
             Self {
                 source: data,
-                offset: Cell::new(offset),
+                offset,
             }
         }
     }
 
     impl<'a> ReaderView for ReadableMemory<'a> {
-        fn read(&self, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
-            let rest = self.source.len() - self.offset.get();
+        fn read(&mut self, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
+            let rest = self.source.len() - self.offset;
             let bytes = if count > rest { rest } else { count };
 
-            (&mut buffer[..bytes]).copy_from_slice(&self.source[self.offset.get()..self.offset.get() + bytes]);
-            self.offset.set(self.offset.get() + bytes);
+            (&mut buffer[..bytes]).copy_from_slice(&self.source[self.offset..self.offset + bytes]);
+            self.offset += bytes;
 
             Ok(bytes)
         }

@@ -136,9 +136,9 @@ impl<T: RandomReaderView> Table<T> {
     fn read_block(verify_checksum: bool, file: &T, block_handle: &BlockHandle) -> io::Result<Vec<u8>> {
         let target_size = block_handle.size + super::BLOCK_TRAILER_SIZE;
         let mut result = vec![0; target_size];
-        file.read(block_handle.offset as u64, target_size, result.as_mut_slice())?;
+        let read_len = file.read(block_handle.offset as u64, target_size, result.as_mut_slice())?;
 
-        if result.len() != target_size {
+        if read_len != target_size {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated block read"));
         }
 

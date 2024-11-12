@@ -894,7 +894,7 @@ impl VersionSet {
 
         let mut builder = VersionBuilder::new(self, self.latest_version());
 
-        let reader = wal::Reader::new(file);
+        let mut reader = wal::Reader::new(file);
         while let Some(record) = reader.read_record() {
             let edit = VersionEdit::make_from(record).map_err(|err| {
                 io::Error::new(io::ErrorKind::InvalidData, err)
