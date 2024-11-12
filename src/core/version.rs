@@ -15,7 +15,6 @@ use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
 use crate::utils::coding;
 
-type RefTableCache = Rc<RefCell<TableCache>>;
 
 pub struct FileMetaData {
     refs: AtomicU32,
@@ -388,11 +387,11 @@ impl LevelIterator for VersionLevelFileIterator {
 }
 
 struct FileIteratorGen {
-    table_cache: RefTableCache,
+    table_cache: Arc<TableCache>,
 }
 
 impl FileIteratorGen {
-    fn new(table_cache: RefTableCache) -> Self {
+    fn new(table_cache: Arc<TableCache>) -> Self {
         Self {
             table_cache
         }
@@ -407,7 +406,7 @@ impl IteratorGen for FileIteratorGen {
 
         let file_number = coding::decode_fixed64(data);
         let file_size = coding::decode_fixed64(&data[8..]);
-        self.table_cache.borrow_mut().iter(file_number, file_size)
+        self.table_cache.iter(file_number, file_size)
     }
 }
 
@@ -736,7 +735,6 @@ pub struct VersionSet {
     db_name: String,
     options: Options,
     versions: VecDeque<Arc<Version>>,
-    current: Arc<Version>,
     next_file_number: u64,
     last_sequence: u64,
     log_number: u64,
@@ -744,7 +742,7 @@ pub struct VersionSet {
     manifest_file_number: u64,
     manifest_logger: Option<wal::Writer<file::WritableFile>>,
     compact_pointers: [InternalKey; logs::NUM_LEVELS],
-    // table_cache: RefTableCache,
+    table_cache: Arc<TableCache>,
 }
 
 impl VersionSet {
@@ -753,7 +751,6 @@ impl VersionSet {
             db_name: String::from(db_name),
             options,
             versions: VecDeque::new(),
-            current: Arc::new(Version::new()),
             next_file_number: 2,
             last_sequence: 0,
             log_number: 0,
@@ -761,9 +758,9 @@ impl VersionSet {
             manifest_file_number: 0,
             manifest_logger: None,
             compact_pointers: Default::default(),
-            // table_cache: Rc::new(RefCell::new(TableCache::new(db_name, options))),
+            table_cache: Arc::new(TableCache::new(db_name, options)),
         };
-        set.versions.push_back(set.current.clone());
+        set.versions.push_back(Arc::new(Version::new()));
         set
     }
 
@@ -789,11 +786,11 @@ impl VersionSet {
     }
 
     pub fn latest_version(&self) -> Arc<Version> {
-        self.current.clone()
+        self.versions.back().unwrap().clone()
     }
 
     pub fn num_level_files(&self, level: u8) -> usize {
-        self.current.files[level as usize].len()
+        self.latest_version().files[level as usize].len()
     }
 
     pub fn get_new_file_number(&mut self) -> u64 {
@@ -968,17 +965,17 @@ impl VersionSet {
     }
 
     pub fn level_summary(&self) -> String {
+        let current = self.latest_version();
         format!("file[ {0} {1} {2} {3} {4} {5} {6} ]",
-                self.current.files[0].len(), self.current.files[1].len(),
-                self.current.files[2].len(), self.current.files[3].len(),
-                self.current.files[4].len(), self.current.files[5].len(),
-                self.current.files[6].len())
+                current.files[0].len(), current.files[1].len(),
+                current.files[2].len(), current.files[3].len(),
+                current.files[4].len(), current.files[5].len(),
+                current.files[6].len())
     }
 
     fn append_version(&mut self, version: Version) {
         let latest_version = Arc::new(version);
         self.versions.push_back(latest_version.clone());
-        self.current = latest_version;
     }
 
     fn reuse_manifest(&self, manifest_name: &str) -> Option<u64> {
@@ -1027,7 +1024,7 @@ impl VersionSet {
         }
 
         for level in 0..logs::NUM_LEVELS {
-            let files = &self.current.files[level];
+            let files = &self.latest_version().files[level];
             for file in files {
                 edit.add_file(level, file.as_ref().clone());
             }
@@ -1071,19 +1068,20 @@ impl VersionSet {
     }
 
     fn get_other_inputs(&mut self, compaction: &mut Compaction) {
+        let current = self.latest_version();
         let level = compaction.level;
         let (mut start, mut limit) = Self::get_range(&compaction.inputs[0]);
-        compaction.inputs[1] = self.current.get_over_lapping_inputs(level + 1, &start, &limit);
+        compaction.inputs[1] = current.get_over_lapping_inputs(level + 1, &start, &limit);
 
         let (mut smallest, mut largest) = Self::get_range2(&compaction.inputs[0], &compaction.inputs[1]);
         if !compaction.inputs[1].is_empty() {
-            let expanded0 = self.current.get_over_lapping_inputs(level, &smallest, &largest);
+            let expanded0 = current.get_over_lapping_inputs(level, &smallest, &largest);
             let inputs0_size = total_file_size(&compaction.inputs[0]);
             let inputs1_size = total_file_size(&compaction.inputs[1]);
             let expanded0_size = total_file_size(&expanded0);
             if expanded0.len() > compaction.inputs[0].len() && inputs1_size + expanded0_size < expanded_compaction_byte_size_limit(&self.options) {
                 let (new_start, new_limit) = Self::get_range(&expanded0);
-                let expanded1 = self.current.get_over_lapping_inputs(level + 1, &new_start, &new_limit);
+                let expanded1 = current.get_over_lapping_inputs(level + 1, &new_start, &new_limit);
                 if expanded1.len() == compaction.inputs[1].len() {
                     log::info!("Expanding level[{0}] {1}+{2} ({3}+{4} bytes) to {5}+{6} ({7}+{8} bytes)", level,
                         compaction.inputs[0].len(), compaction.inputs[1].len(), inputs0_size, inputs1_size,
@@ -1099,7 +1097,7 @@ impl VersionSet {
         }
 
         if level + 2 < logs::NUM_LEVELS {
-            compaction.grandparents = self.current.get_over_lapping_inputs(level + 2, &smallest, &largest);
+            compaction.grandparents = current.get_over_lapping_inputs(level + 2, &smallest, &largest);
         }
 
         compaction.edit.set_compact_pointer(level, limit.clone());
@@ -1107,23 +1105,24 @@ impl VersionSet {
     }
 
     pub fn pick_compaction(&mut self) -> Option<Compaction> {
+        let current = self.latest_version();
         let mut compaction: Compaction;
         let level: usize;
-        let size_compaction = self.current.compaction_score >= 1.0;
+        let size_compaction = current.compaction_score >= 1.0;
 
         if size_compaction {
-            level = self.current.compaction_level;
+            level = current.compaction_level;
             compaction = Compaction::new(self.options, level);
-            for file in &self.current.files[level] {
+            for file in &current.files[level] {
                 if file.largest > self.compact_pointers[level] {
                     compaction.inputs[0].push(file.clone());
                     break;
                 }
             }
             if compaction.inputs[0].is_empty() {
-                compaction.inputs[0].push(self.current.files[level][0].clone());
+                compaction.inputs[0].push(current.files[level][0].clone());
             }
-        } else if let Some(seek_compaction) = self.current.file_to_compact.read().unwrap().as_ref() {
+        } else if let Some(seek_compaction) = current.file_to_compact.read().unwrap().as_ref() {
             level = seek_compaction.level;
             compaction = Compaction::new(self.options, seek_compaction.level);
             compaction.inputs[0].push(seek_compaction.file.clone());
@@ -1133,7 +1132,7 @@ impl VersionSet {
 
         if level == 0 {
             let (smallest, largest) = Self::get_range(&compaction.inputs[0]);
-            compaction.inputs[0] = self.current.get_over_lapping_inputs(0, &smallest, &largest);
+            compaction.inputs[0] = current.get_over_lapping_inputs(0, &smallest, &largest);
         }
 
         self.get_other_inputs(&mut compaction);
