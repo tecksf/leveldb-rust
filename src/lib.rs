@@ -22,7 +22,7 @@ impl From<u8> for CompressionType {
     }
 }
 
-pub trait FilterPolicy {
+pub trait FilterPolicy: Send + Sync {
     fn name(&self) -> String;
     fn key_may_match(&self, filter: &[u8], key: &[u8]) -> bool;
     fn create_filter(&self, keys: Vec<&[u8]>) -> Vec<u8>;

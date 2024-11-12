@@ -1,6 +1,9 @@
 use std::{fs, io};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use crate::logs::filename;
 
@@ -10,11 +13,11 @@ pub trait WriterView {
     fn flush(&mut self) -> io::Result<()>;
 }
 
-pub trait ReaderView {
+pub trait ReaderView: Send + Sync {
     fn read(&mut self, count: usize, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
-pub trait RandomReaderView {
+pub trait RandomReaderView: Send + Sync {
     fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
@@ -92,7 +95,7 @@ impl RandomReaderView for ReadableFile {
         }
         #[cfg(unix)]
         {
-            self.file.read_exact_at(buf, offset)
+            self.file.read_at(buf, offset)
         }
     }
 }

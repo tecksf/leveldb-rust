@@ -1,5 +1,6 @@
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 use crate::logs::file::RandomReaderView;
 use crate::{CompressionType, FilterPolicy, Options};
 use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
@@ -10,18 +11,18 @@ use crate::utils::coding;
 
 pub struct Table<T> {
     options: Options,
-    file: Rc<T>,
+    file: Arc<T>,
     index_block: Block,
     filter: Option<Filter>,
 }
 
 pub struct BlockIteratorGen<T> {
-    file: Rc<T>,
+    file: Arc<T>,
     paranoid_checks: bool,
 }
 
 impl<T: RandomReaderView> BlockIteratorGen<T> {
-    fn new(file: Rc<T>, paranoid_checks: bool) -> Self {
+    fn new(file: Arc<T>, paranoid_checks: bool) -> Self {
         Self {
             file,
             paranoid_checks,
@@ -59,7 +60,7 @@ impl<T: RandomReaderView> Table<T> {
 
         Ok(Self {
             options,
-            file: Rc::new(file),
+            file: Arc::new(file),
             index_block,
             filter,
         })

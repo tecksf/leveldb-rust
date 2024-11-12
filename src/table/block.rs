@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 use crate::{table, FilterPolicy};
 use crate::core::iterator::LevelIterator;
 use crate::utils::coding;
@@ -43,7 +43,7 @@ impl BlockHandle {
 }
 
 pub struct Block {
-    data: Rc<Vec<u8>>,
+    data: Arc<Vec<u8>>,
     restart_offset: usize,
 }
 
@@ -52,7 +52,7 @@ impl Block {
         if data.len() < 4 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "block size is less than 4 bytes"));
         }
-        let mut block = Block { data: Rc::new(data), restart_offset: 0 };
+        let mut block = Block { data: Arc::new(data), restart_offset: 0 };
         block.restart_offset = block.data.len() - ((1 + block.num_restarts()) * 4) as usize;
         Ok(block)
     }
@@ -71,7 +71,7 @@ impl Block {
 }
 
 pub struct BlockIterator {
-    data: Rc<Vec<u8>>,
+    data: Arc<Vec<u8>>,
     restart_offset: usize,
     num_restarts: usize,
     restart_index: Cell<usize>,
@@ -82,7 +82,7 @@ pub struct BlockIterator {
 }
 
 impl BlockIterator {
-    fn new(data: Rc<Vec<u8>>, restart_offset: usize, num_restarts: usize, compare: fn(&[u8], &[u8]) -> Ordering) -> Self {
+    fn new(data: Arc<Vec<u8>>, restart_offset: usize, num_restarts: usize, compare: fn(&[u8], &[u8]) -> Ordering) -> Self {
         Self {
             data,
             restart_offset,
