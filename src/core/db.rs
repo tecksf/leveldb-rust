@@ -12,7 +12,7 @@ use crate::core::format::{Comparator, InternalKey, LookupKey};
 use crate::core::memory::MemoryTable;
 use crate::core::schedule;
 use crate::core::sst::build_table;
-use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
+use crate::core::version::{Compaction, FileMetaData, Version, VersionEdit, VersionSet};
 use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
@@ -440,12 +440,14 @@ impl DatabaseImpl {
                 db.versions.log_and_apply(compaction.edit).unwrap();
                 log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, db.versions.level_summary());
             } else {
-                db.do_compaction_work();
+                db.do_compaction_work(&compaction);
             }
         }
     }
 
-    fn do_compaction_work(&self) {}
+    fn do_compaction_work(&self, compaction: &Compaction) {
+        let _ = self.versions.make_input_iterator(compaction);
+    }
 
     fn compact_memory_table(database: Arc<Mutex<Self>>) {
         let mut db = database.lock();

@@ -1139,17 +1139,17 @@ impl VersionSet {
 
             if compaction.level + level == 0 {
                 for file in &compaction.inputs[level] {
-                    // let table_iter = self.table_cache.borrow_mut().iter(file.number, file.file_size);
-                    // if let Some(iter) = table_iter {
-                    //     iterator_list.push(iter);
-                    // }
+                    let table_iter = self.table_cache.iter(file.number, file.file_size);
+                    if let Some(iter) = table_iter {
+                        iterator_list.push(iter);
+                    }
                 }
             } else {
-                // let iter = TwoLevelIterator::new(
-                //     VersionLevelFileIterator::new(compaction.inputs[level].clone()),
-                //     FileIteratorGen::new(self.table_cache.clone()),
-                // );
-                // iterator_list.push(Box::new(iter));
+                let iter = TwoLevelIterator::new(
+                    VersionLevelFileIterator::new(compaction.inputs[level].clone()),
+                    FileIteratorGen::new(self.table_cache.clone()),
+                );
+                iterator_list.push(Box::new(iter));
             }
         }
 
