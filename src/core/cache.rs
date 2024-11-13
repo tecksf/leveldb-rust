@@ -76,11 +76,9 @@ impl<T> LinkedList<T> {
             return None;
         }
 
-        unsafe {
-            let link = self.head;
-            self.pop(self.head);
-            Some(link)
-        }
+        let link = self.head;
+        self.pop(self.head);
+        Some(link)
     }
 
     fn pop(&mut self, link: Link<T>) {

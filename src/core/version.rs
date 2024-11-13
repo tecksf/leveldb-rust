@@ -1,13 +1,12 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
 use std::{fs, io};
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicI32, AtomicU32};
 use crate::core::format;
-use crate::core::format::{Comparator, InternalKey, UserKey};
+use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey};
 use crate::{logs, Options};
 use crate::core::cache::TableCache;
 use crate::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
@@ -149,7 +148,6 @@ struct SeekCompactionInfo {
 }
 
 pub struct Version {
-    refs: AtomicI32,
     files: [Vec<Arc<FileMetaData>>; logs::NUM_LEVELS],
 
     // seek compaction
@@ -158,16 +156,17 @@ pub struct Version {
     // size compaction
     compaction_score: f64,
     compaction_level: usize,
+    table_cache: Arc<TableCache>,
 }
 
 impl Version {
-    pub fn new() -> Self {
+    pub fn new(version_set: &VersionSet) -> Self {
         Self {
-            refs: AtomicI32::new(0),
             files: Default::default(),
             file_to_compact: RwLock::new(None),
             compaction_level: 0,
             compaction_score: -1.0,
+            table_cache: version_set.table_cache.clone(),
         }
     }
 
@@ -198,9 +197,9 @@ impl Version {
         false
     }
 
-    pub fn get<T>(&self, internal_key: &InternalKey, mut seek: T) -> bool
-        where T: FnMut(Arc<FileMetaData>) -> bool
-    {
+    pub fn get(&self, lookup_key: &LookupKey) -> (io::Result<Vec<u8>>, GetStatistics) {
+        let internal_key = lookup_key.extract_internal_key();
+        let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
         let mut stats = GetStatistics::default();
         let mut last_file_read: Option<Arc<FileMetaData>> = None;
         let mut last_file_read_level: usize = 0;
@@ -214,10 +213,21 @@ impl Version {
             last_file_read = Some(file.clone());
             last_file_read_level = level;
 
-            seek(file)
+            return match self.table_cache.get(file.number, file.file_size, &internal_key) {
+                Ok(table_result) => {
+                    if let Some(value) = table_result {
+                        result = Ok(value);
+                    };
+                    true
+                }
+                Err(err) => {
+                    result = Err(err);
+                    false
+                }
+            };
         };
-        self.for_each_overlapping(internal_key, seek_wrapper);
-        self.update_statistics(&stats)
+        self.for_each_overlapping(&internal_key, seek_wrapper);
+        (result, stats)
     }
 
     pub fn pick_level_for_memory_table(&self, smallest: &UserKey, largest: &UserKey) -> usize {
@@ -694,7 +704,7 @@ impl<'a> VersionBuilder<'a> {
     }
 
     fn generate_new_version(&self) -> Version {
-        let mut new_version = Version::new();
+        let mut new_version = Version::new(self.version_set);
 
         for (level, base_file_metas) in self.version.files.iter().enumerate() {
             let ref added_file_metas = self.levels[level].added_files;
@@ -760,29 +770,8 @@ impl VersionSet {
             compact_pointers: Default::default(),
             table_cache: Arc::new(TableCache::new(db_name, options)),
         };
-        set.versions.push_back(Arc::new(Version::new()));
+        set.versions.push_back(Arc::new(Version::new(&set)));
         set
-    }
-
-    pub fn get(&self, internal_key: &InternalKey) -> (io::Result<Vec<u8>>, bool) {
-        let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
-        let version = self.latest_version();
-        let seek_cache = |file: Arc<FileMetaData>| {
-            // let mut table_cache = self.table_cache.borrow_mut();
-            // match table_cache.get(file.number, file.file_size, internal_key) {
-            //     Ok(table_result) => {
-            //         if let Some(value) = table_result {
-            //             result = Ok(value);
-            //         };
-            //         return true;
-            //     }
-            //     Err(err) => result = Err(err),
-            // };
-            false
-        };
-
-        let has_stats_update = version.get(internal_key, seek_cache);
-        (result, has_stats_update)
     }
 
     pub fn latest_version(&self) -> Arc<Version> {
@@ -1268,7 +1257,8 @@ mod tests {
             ("200", "400"),
             ("500", "800"),
         ];
-        let mut version = Version::new();
+        let version_set = VersionSet::new("test", Options::default());
+        let mut version = Version::new(&version_set);
         for i in 0..4usize {
             version.files[0].push(Arc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
         }
@@ -1325,7 +1315,7 @@ mod tests {
     #[test]
     fn test_merge_multi_version_edit() {
         let mut version_set = VersionSet::new("test", Options::default());
-        let base_version = Arc::new(Version::new());
+        let base_version = Arc::new(Version::new(&version_set));
         let mut builder = VersionBuilder::new(&mut version_set, base_version);
 
         let edit1 = create_version_edit1();

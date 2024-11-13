@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::io;
 use crate::logs::file::{ReaderView, WriterView};
 use crate::utils::coding;

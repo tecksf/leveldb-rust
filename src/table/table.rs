@@ -1,5 +1,4 @@
 use std::io;
-use std::rc::Rc;
 use std::sync::Arc;
 use crate::logs::file::RandomReaderView;
 use crate::{CompressionType, FilterPolicy, Options};

@@ -128,6 +128,7 @@ impl Database {
     pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
         let db_impl = self.db_impl.lock();
         let sequence = db_impl.versions.get_last_sequence();
+        let version = db_impl.versions.latest_version();
         let mutable = db_impl.mutable.clone();
         let immutable = db_impl.immutable.clone();
 
@@ -152,10 +153,8 @@ impl Database {
             }
         }
 
-        let db_impl = self.db_impl.lock();
-        let internal_key = lookup_key.extract_internal_key();
-        let (result, has_stats_update) = db_impl.versions.get(&internal_key);
-        if has_stats_update {
+        let (result, statistics) = version.get(&lookup_key);
+        if version.update_statistics(&statistics) {
             self.maybe_schedule_compaction();
         }
 

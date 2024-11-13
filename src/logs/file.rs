@@ -1,6 +1,6 @@
 use std::{fs, io};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -87,7 +87,7 @@ impl ReaderView for ReadableFile {
 }
 
 impl RandomReaderView for ReadableFile {
-    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<(usize)> {
+    fn read(&self, offset: u64, count: usize, buffer: &mut [u8]) -> io::Result<usize> {
         let buf = &mut buffer[..count];
         #[cfg(windows)]
         {
