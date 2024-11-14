@@ -32,6 +32,13 @@ pub struct Database {
     background_work_finished_signal: Arc<Condvar>,
 }
 
+impl Drop for Database {
+    fn drop(&mut self) {
+        self.dispatcher.terminate();
+        log::info!("Database Closed");
+    }
+}
+
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
         Ok(Self {

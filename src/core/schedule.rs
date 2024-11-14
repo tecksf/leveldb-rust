@@ -59,6 +59,7 @@ impl Dispatcher {
         }
         self.background_thread_cv.notify_one();
         if let Some(handle) = background_thread {
+            log::info!("Waiting background work finish...");
             handle.join().unwrap();
         }
     }
