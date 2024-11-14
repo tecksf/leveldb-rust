@@ -83,10 +83,10 @@ impl Database {
         let mut write_batch = WriteBatch::new();
         let last_agent = Self::build_batch_group(&db_impl.agents, &mut write_batch);
 
-        let mut write_ahead_logger = db_impl.write_ahead_logger.take();
         let mut last_sequence = db_impl.versions.get_last_sequence();
         let mutable = db_impl.mutable.clone();
         let mut result = self.make_room_for_write(&mut db_impl, false);
+        let mut write_ahead_logger = db_impl.write_ahead_logger.take();
 
         drop(db_impl);
 
