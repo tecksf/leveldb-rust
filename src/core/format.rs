@@ -170,11 +170,11 @@ impl PartialOrd for InternalKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         let k1 = self.extract_user_key();
         let k2 = other.extract_user_key();
-        let rc = k1.cmp(&k2);
+        let rc = k1.partial_cmp(&k2)?;
         if rc == Ordering::Equal {
             let n1 = self.extract_sequence();
             let n2 = other.extract_sequence();
-            return Some(n2.cmp(&n1));
+            return n2.partial_cmp(&n1);
         }
         Some(rc)
     }
@@ -362,5 +362,9 @@ mod tests {
         let k5 = InternalKey::restore("123", 1, ValueType::Insertion);
         let k6 = InternalKey::restore("123", 2, ValueType::Insertion);
         assert!(k6 < k5);
+
+        let k7 = InternalKey::restore("abc", 1, ValueType::Insertion);
+        let k8 = InternalKey::restore("abc", 1, ValueType::Deletion);
+        assert!(k1 == k2);
     }
 }

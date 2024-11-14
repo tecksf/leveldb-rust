@@ -216,33 +216,40 @@ impl MemoryTable {
 
     pub fn get(&self, lookup_key: &LookupKey) -> io::Result<Option<Vec<u8>>> {
         let mut prev = vec![Link::Nil; MAX_HEIGHT];
-        if let Link::Ptr(ptr) = self.table.find(&lookup_key, prev.as_mut_slice()) {
-            let result = &ptr.borrow().key;
-            return Ok(Some(Vec::from(result.get_raw_value())));
-        }
-
-        if let Link::Ptr(p1) = &prev[0] {
-            if let Link::Ptr(p2) = p1.borrow().get_next(0) {
-                let seek_key = &p2.borrow().key;
-                let key1 = seek_key.extract_internal_key();
-                let key2 = lookup_key.extract_internal_key();
-                if key1.extract_user_key() == key2.extract_user_key() {
-                    return if key1.extract_value_type() == ValueType::Insertion {
-                        Ok(Some(Vec::from(seek_key.get_raw_value())))
+        let link_node = match self.table.find(&lookup_key, prev.as_mut_slice()) {
+            Link::Ptr(p) => Link::Ptr(p),
+            Link::Nil => {
+                if let Link::Ptr(p1) = &prev[0] {
+                    if let Link::Ptr(p2) = p1.borrow().get_next(0) {
+                        Link::Ptr(p2)
                     } else {
-                        Ok(None)
-                    };
+                        Link::Nil
+                    }
+                } else {
+                    Link::Nil
                 }
             }
-        }
+        };
 
+        if let Link::Ptr(ptr) = link_node {
+            let seek_key = &ptr.borrow().key;
+            let key1 = seek_key.extract_internal_key();
+            let key2 = lookup_key.extract_internal_key();
+            if key1.extract_user_key() == key2.extract_user_key() {
+                return if key1.extract_value_type() == ValueType::Insertion {
+                    Ok(Some(Vec::from(seek_key.get_raw_value())))
+                } else {
+                    Ok(None)
+                };
+            }
+        }
         Err(io::Error::new(io::ErrorKind::NotFound, ""))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::core::format::ValueType;
+    use crate::core::format::{LookupKey, ValueType};
     use crate::core::memory::{MemoryTable, SkipList};
 
     #[test]
@@ -297,6 +304,26 @@ mod tests {
         for i in 0..expected.len() {
             assert_eq!(result[i].0, expected[i].0);
             assert_eq!(result[i].1, expected[i].1);
+        }
+
+        for (exist_key, value) in [("C++", "100"), ("Rust", "200"), ("Python", "500")] {
+            let lookup_key = LookupKey::new(exist_key, 99);
+            let result = table.get(&lookup_key);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), Some(Vec::from(value)));
+        }
+
+        for not_exist_key in ["Kotlin", "Scala"] {
+            let lookup_key = LookupKey::new(not_exist_key, 99);
+            let result = table.get(&lookup_key);
+            assert!(result.is_err());
+        }
+
+        for deleted_key in ["Java"] {
+            let lookup_key = LookupKey::new(deleted_key, 6);
+            let result = table.get(&lookup_key);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), None);
         }
     }
 }
