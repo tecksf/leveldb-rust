@@ -106,7 +106,7 @@ impl Comparator for UserKey<'_> {
 }
 
 
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, Clone)]
 pub struct InternalKey {
     payload: Vec<u8>,
 }
@@ -163,6 +163,12 @@ impl InternalKey {
         let sequence = coding::decode_fixed64(info);
         let value_type = (sequence & 0xff) as u8;
         value_type.into()
+    }
+}
+
+impl PartialEq for InternalKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other).unwrap().is_eq()
     }
 }
 
@@ -234,7 +240,7 @@ impl Comparator for InternalKey {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, Clone)]
 pub struct LookupKey {
     payload: Vec<u8>,
 }
@@ -266,6 +272,12 @@ impl LookupKey {
         let value_offset = internal_key.len() + w as usize;
         let (value, _) = coding::get_length_prefixed_slice(&self.payload[value_offset..]);
         value
+    }
+}
+
+impl PartialEq for LookupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other).unwrap().is_eq()
     }
 }
 
@@ -365,6 +377,6 @@ mod tests {
 
         let k7 = InternalKey::restore("abc", 1, ValueType::Insertion);
         let k8 = InternalKey::restore("abc", 1, ValueType::Deletion);
-        assert!(k1 == k2);
+        assert!(k7 == k8);
     }
 }

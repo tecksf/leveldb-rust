@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn test_task_schedule() {
         let result = Arc::new(Mutex::new(0));
-        let mut dispatcher = Dispatcher::new();
+        let dispatcher = Dispatcher::new();
 
         for i in 0..10 {
             let number = result.clone();
