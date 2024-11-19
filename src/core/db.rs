@@ -32,6 +32,8 @@ struct Agent {
 
 #[derive(Clone)]
 pub struct Database {
+    name: String,
+    options: Options,
     db_impl: Arc<Mutex<DatabaseImpl>>,
     has_imm: Arc<AtomicBool>,
     dispatcher: schedule::Dispatcher,
@@ -47,8 +49,39 @@ impl Drop for Database {
 
 impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
+        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        log::info!("Opening database at path: {}", path.as_ref());
+
+        let db_impl = Arc::new(Mutex::new(DatabaseImpl::new(path.as_ref(), options)));
+        let mut db = db_impl.lock();
+        let mut edit = db.recover()?;
+
+        // has log number indicate that reuse log file
+        db.log_file_number = if let Some(number) = edit.get_log_number() {
+            number
+        } else {
+            db.versions.get_new_file_number()
+        };
+
+        if db.write_ahead_logger.is_none() {
+            let file = WritableFile::open(filename::make_log_file_name(path.as_ref(), db.log_file_number))?;
+            db.write_ahead_logger = Some(wal::Writer::new(file));
+        }
+
+        if edit.has_updated() || edit.get_log_number().is_none() {
+            edit.set_prev_log_number(0);
+            edit.set_log_number(db.log_file_number);
+            db.versions.log_and_apply(edit)?;
+        }
+
+        db.remove_obsolete_files();
+
+        drop(db);
+
         Ok(Self {
-            db_impl: Arc::new(Mutex::new(DatabaseImpl::new(path.as_ref(), options)?)),
+            name: String::from(path.as_ref()),
+            options,
+            db_impl,
             has_imm: Arc::new(AtomicBool::new(false)),
             dispatcher: schedule::Dispatcher::new(),
             background_work_finished_signal: Arc::new(Condvar::new()),
@@ -222,7 +255,7 @@ impl Database {
                 self.background_work_finished_signal.wait(&mut database);
             } else {
                 let new_log_number = database.versions.get_new_file_number();
-                let status = WritableFile::open(filename::make_log_file_name(database.name.as_str(), new_log_number));
+                let status = WritableFile::open(filename::make_log_file_name(self.name.as_str(), new_log_number));
                 match status {
                     Ok(file) => {
                         database.log_file_number = new_log_number;
@@ -287,13 +320,11 @@ impl Database {
         let table = db.immutable.as_ref().unwrap().clone();
         let base = db.versions.latest_version();
         let file_number = db.versions.get_new_file_number();
-        let options = db.options;
-        let db_name = String::from(db.name.as_str());
         let log_file_number = db.log_file_number;
 
         drop(db);
 
-        let result = DatabaseImpl::write_level0_table(options, db_name.as_str(), Some(&base), file_number, &table);
+        let result = DatabaseImpl::write_level0_table(self.options, self.name.as_str(), Some(&base), file_number, &table);
         if result.is_err() {
             return;
         }
@@ -376,20 +407,16 @@ impl Database {
 
     fn open_compaction_output_file(&self, compact: &mut CompactionState) -> io::Result<()> {
         let file_number;
-        let path;
-        let options;
         {
             let mut db = self.db_impl.lock();
             file_number = db.versions.get_new_file_number();
-            path = db.name.clone();
-            options = db.options;
         }
 
-        let file_name = filename::make_table_file_name(path.as_ref(), file_number);
+        let file_name = filename::make_table_file_name(self.name.as_str(), file_number);
         let mut file_meta = FileMetaData::new();
         file_meta.number = file_number;
         compact.outputs.push(file_meta);
-        compact.table_builder = Some(TableBuilder::new(options, WritableFile::open(&file_name)?));
+        compact.table_builder = Some(TableBuilder::new(self.options, WritableFile::open(&file_name)?));
 
         Ok(())
     }
@@ -408,11 +435,8 @@ struct DatabaseImpl {
 }
 
 impl DatabaseImpl {
-    pub fn new(path: &str, options: Options) -> io::Result<Self> {
-        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
-        log::info!("Opening database at path: {}", path);
-
-        let mut db = DatabaseImpl {
+    pub fn new(path: &str, options: Options) -> Self {
+        Self {
             name: String::from(path),
             options,
             write_ahead_logger: None,
@@ -422,35 +446,34 @@ impl DatabaseImpl {
             versions: VersionSet::new(path, options),
             stats: Default::default(),
             agents: LinkedList::new(),
-        };
-
-        db.init()?;
-        let mut edit = db.recover()?;
-
-        // has log number indicate that reuse log file
-        db.log_file_number = if let Some(number) = edit.get_log_number() {
-            number
-        } else {
-            db.versions.get_new_file_number()
-        };
-
-        if db.write_ahead_logger.is_none() {
-            let file = WritableFile::open(filename::make_log_file_name(path.as_ref(), db.log_file_number))?;
-            db.write_ahead_logger = Some(wal::Writer::new(file));
         }
-
-        if edit.has_updated() || edit.get_log_number().is_none() {
-            edit.set_prev_log_number(0);
-            edit.set_log_number(db.log_file_number);
-            db.versions.log_and_apply(edit)?;
-        }
-
-        db.remove_obsolete_files();
-
-        Ok(db)
     }
 
-    fn init(&self) -> io::Result<()> {
+    fn create_manifest(&self) -> io::Result<()> {
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name(InternalKey::name());
+        edit.set_log_number(0);
+        edit.set_next_file_number(2);
+        edit.set_last_sequence(0);
+
+        let result: io::Result<()>;
+        let manifest = filename::make_manifest_file_name(self.name.as_str(), 1);
+        {
+            let mut manifest_logger = wal::Writer::new(WritableFile::open(&manifest)?);
+            let record = edit.encode();
+            result = manifest_logger.add_record(record);
+        }
+
+        if result.is_ok() {
+            file::set_current_file(self.name.as_str(), 1)?;
+        } else {
+            fs::remove_file(manifest)?;
+        }
+
+        result
+    }
+
+    fn recover(&mut self) -> io::Result<VersionEdit> {
         fs::create_dir(&self.name).unwrap_or_default();
 
         let lock_file_name = filename::make_lock_file_name(self.name.as_str());
@@ -459,7 +482,7 @@ impl DatabaseImpl {
         if fs::metadata(filename::make_current_file_name(self.name.as_str())).is_err() {
             if self.options.create_if_missing {
                 log::info!("Creating DB {} since it was missing", self.name);
-                Self::create_manifest(self.name.as_str(), InternalKey::name().as_str())?;
+                self.create_manifest()?;
             } else {
                 return Err(io::Error::new(io::ErrorKind::Other, format!("InvalidArgument:{} does not exist(create_if_missing is false)", self.name)));
             }
@@ -469,34 +492,6 @@ impl DatabaseImpl {
             }
         }
 
-        Ok(())
-    }
-
-    fn create_manifest(db_name: &str, comparator_name: &str) -> io::Result<()> {
-        let mut edit = VersionEdit::new();
-        edit.set_comparator_name(String::from(comparator_name));
-        edit.set_log_number(0);
-        edit.set_next_file_number(2);
-        edit.set_last_sequence(0);
-
-        let result: io::Result<()>;
-        let manifest = filename::make_manifest_file_name(db_name, 1);
-        {
-            let mut manifest_logger = wal::Writer::new(WritableFile::open(&manifest)?);
-            let record = edit.encode();
-            result = manifest_logger.add_record(record);
-        }
-
-        if result.is_ok() {
-            file::set_current_file(db_name, 1)?;
-        } else {
-            fs::remove_file(manifest)?;
-        }
-
-        result
-    }
-
-    fn recover(&mut self) -> io::Result<VersionEdit> {
         self.versions.recover()?;
         let min_log = self.versions.get_log_number();
         let prev_log = self.versions.get_prev_log_number();
