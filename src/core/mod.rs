@@ -7,3 +7,4 @@ mod sst;
 mod version;
 mod cache;
 mod schedule;
+mod compaction;

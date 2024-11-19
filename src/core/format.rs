@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::ops::Deref;
 use crate::utils::coding;
 
 #[repr(u8)]
@@ -60,6 +61,14 @@ impl<'a> AsRef<[u8]> for UserKey<'a> {
 
 impl<'a> Into<&'a [u8]> for UserKey<'a> {
     fn into(self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+impl<'a> Deref for UserKey<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
         self.payload
     }
 }
@@ -201,6 +210,18 @@ impl AsRef<[u8]> for InternalKey {
 impl Default for InternalKey {
     fn default() -> Self {
         Self::new("")
+    }
+}
+
+impl From<Vec<u8>> for InternalKey {
+    fn from(value: Vec<u8>) -> Self {
+        if value.len() < Self::MIN_LEN {
+            InternalKey::default()
+        } else {
+            Self {
+                payload: value
+            }
+        }
     }
 }
 

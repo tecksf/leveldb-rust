@@ -9,6 +9,7 @@ use crate::core::format;
 use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey};
 use crate::{logs, Options};
 use crate::core::cache::TableCache;
+use crate::core::compaction::{threshold, Compaction};
 use crate::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
@@ -84,62 +85,6 @@ impl Ord for FileMetaData {
 pub struct GetStatistics {
     seek_file: Option<Arc<FileMetaData>>,
     seek_file_level: usize,
-}
-
-fn total_file_size(files: &Vec<Arc<FileMetaData>>) -> u64 {
-    let mut sum: u64 = 0;
-    for file in files {
-        sum += file.file_size;
-    }
-    sum
-}
-
-fn max_bytes_for_level(level: usize) -> f64 {
-    let mut level = level;
-    let mut result: f64 = 10.0 * 1048576.0;
-    while level > 1 {
-        result *= 10.0;
-        level -= 1;
-    }
-    result
-}
-
-fn target_file_size(options: &Options) -> u64 {
-    options.max_file_size
-}
-
-fn max_grand_parent_overlap_bytes(options: &Options) -> u64 {
-    10 * target_file_size(&options)
-}
-
-fn expanded_compaction_byte_size_limit(options: &Options) -> u64 {
-    25 * target_file_size(&options)
-}
-
-pub struct Compaction {
-    options: Options,
-    pub level: usize,
-    pub edit: VersionEdit,
-    pub inputs: [Vec<Arc<FileMetaData>>; 2],
-    pub grandparents: Vec<Arc<FileMetaData>>,
-}
-
-impl Compaction {
-    pub fn new(options: Options, level: usize) -> Self {
-        Self {
-            level,
-            options,
-            edit: VersionEdit::new(),
-            inputs: Default::default(),
-            grandparents: Default::default(),
-        }
-    }
-
-    pub fn is_trivial_move(&self) -> bool {
-        self.inputs[0].len() == 1 &&
-            self.inputs[1].len() == 0 &&
-            total_file_size(&self.grandparents) <= max_grand_parent_overlap_bytes(&self.options)
-    }
 }
 
 struct SeekCompactionInfo {
@@ -243,7 +188,7 @@ impl Version {
 
                 if level + 2 < logs::NUM_LEVELS {
                     let overlaps = self.get_over_lapping_inputs(level + 2, &small_key, &large_key);
-                    if total_file_size(&overlaps) > 2 * 1024 * 1024 {
+                    if threshold::total_file_size(&overlaps) > 2 * 1024 * 1024 {
                         break;
                     }
                 }
@@ -251,6 +196,19 @@ impl Version {
             }
         }
         level
+    }
+
+    pub fn exists_in_nonzero_level(&self, level: usize, user_key: &UserKey) -> bool {
+        let files = &self.files[level];
+        let seek_key = InternalKey::restore(user_key, format::MAX_SEQUENCE_NUMBER, format::INSERTION_TYPE_FOR_SEEK);
+        let index = files.binary_search_by(
+            |meta| meta.largest.cmp(&seek_key)).unwrap_or_else(|index| index);
+
+        if index >= files.len() {
+            return false;
+        }
+
+        user_key.cmp(&files[index].smallest.extract_user_key()).is_ge()
     }
 
     fn overlap_in_level(&self, level: usize, smallest: &UserKey, largest: &UserKey) -> bool {
@@ -990,7 +948,7 @@ impl VersionSet {
             let score: f64 = if level == 0 {
                 version.files[level].len() as f64 / logs::L0_COMPACTION_TRIGGER as f64
             } else {
-                total_file_size(&version.files[level]) as f64 / max_bytes_for_level(level)
+                threshold::total_file_size(&version.files[level]) as f64 / threshold::max_bytes_for_level(level)
             };
 
             if score > best_score {
@@ -1065,10 +1023,10 @@ impl VersionSet {
         let (mut smallest, mut largest) = Self::get_range2(&compaction.inputs[0], &compaction.inputs[1]);
         if !compaction.inputs[1].is_empty() {
             let expanded0 = current.get_over_lapping_inputs(level, &smallest, &largest);
-            let inputs0_size = total_file_size(&compaction.inputs[0]);
-            let inputs1_size = total_file_size(&compaction.inputs[1]);
-            let expanded0_size = total_file_size(&expanded0);
-            if expanded0.len() > compaction.inputs[0].len() && inputs1_size + expanded0_size < expanded_compaction_byte_size_limit(&self.options) {
+            let inputs0_size = threshold::total_file_size(&compaction.inputs[0]);
+            let inputs1_size = threshold::total_file_size(&compaction.inputs[1]);
+            let expanded0_size = threshold::total_file_size(&expanded0);
+            if expanded0.len() > compaction.inputs[0].len() && inputs1_size + expanded0_size < threshold::expanded_compaction_byte_size_limit(&self.options) {
                 let (new_start, new_limit) = Self::get_range(&expanded0);
                 let expanded1 = current.get_over_lapping_inputs(level + 1, &new_start, &new_limit);
                 if expanded1.len() == compaction.inputs[1].len() {
@@ -1101,7 +1059,7 @@ impl VersionSet {
 
         if size_compaction {
             level = current.compaction_level;
-            compaction = Compaction::new(self.options, level);
+            compaction = Compaction::new(self.options, current.clone(), level);
             for file in &current.files[level] {
                 if file.largest > self.compact_pointers[level] {
                     compaction.inputs[0].push(file.clone());
@@ -1113,7 +1071,7 @@ impl VersionSet {
             }
         } else if let Some(seek_compaction) = current.file_to_compact.read().unwrap().as_ref() {
             level = seek_compaction.level;
-            compaction = Compaction::new(self.options, seek_compaction.level);
+            compaction = Compaction::new(self.options, current.clone(), seek_compaction.level);
             compaction.inputs[0].push(seek_compaction.file.clone());
         } else {
             return None;
@@ -1281,6 +1239,12 @@ mod tests {
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("350"), &UserKey::new("450")), 0);
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("120"), &UserKey::new("150")), 0);
         assert_eq!(version.pick_level_for_memory_table(&UserKey::new("370"), &UserKey::new("380")), 1);
+
+        assert!(version.exists_in_nonzero_level(1, &UserKey::new("200")));
+        assert!(version.exists_in_nonzero_level(1, &UserKey::new("650")));
+        assert!(!version.exists_in_nonzero_level(1, &UserKey::new("380")));
+        assert!(!version.exists_in_nonzero_level(1, &UserKey::new("800")));
+        assert!(version.exists_in_nonzero_level(2, &UserKey::new("800")));
 
         version.compaction_level = 0;
         version.compaction_score = 1.2;

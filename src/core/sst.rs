@@ -26,8 +26,7 @@ pub fn build_table(options: Options, path: &str, mut iter: MemoryTableIterator, 
     }
     meta.largest = internal_key;
 
-    builder.finish();
-    if builder.is_ok() {
+    if builder.finish().is_ok() {
         meta.file_size = builder.file_size();
     }
 

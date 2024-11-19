@@ -77,7 +77,7 @@ impl<T: WriterView> TableBuilder<T> {
         }
     }
 
-    pub fn finish(&mut self) {
+    pub fn finish(&mut self) -> io::Result<()> {
         let mut meta_index_block_handle = BlockHandle::default();
         let mut index_block_handle = BlockHandle::default();
 
@@ -132,14 +132,27 @@ impl<T: WriterView> TableBuilder<T> {
         if self.is_ok() {
             self.status = self.file.sync();
         }
+
+        self.get_status()
     }
 
     pub fn is_ok(&self) -> bool {
         self.status.is_ok()
     }
 
+    pub fn get_status(&self) -> io::Result<()> {
+        match &self.status {
+            Ok(()) => Ok(()),
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string()))
+        }
+    }
+
     pub fn file_size(&self) -> u64 {
         self.offset as u64
+    }
+
+    pub fn get_num_entries(&self) -> u64 {
+        self.num_entries
     }
 
     fn abandon(&mut self) {

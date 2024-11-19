@@ -3,19 +3,24 @@ use std::collections::LinkedList;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 use crossbeam_channel::internal::SelectHandle;
 use parking_lot::{Mutex, Condvar, MutexGuard};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
-use crate::core::format::{Comparator, InternalKey, LookupKey};
+use crate::core::compaction::{CompactionState, CompactionStatistics};
+use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey, ValueType, MAX_SEQUENCE_NUMBER};
+use crate::core::iterator::{LevelIterator, MergingIterator};
 use crate::core::memory::MemoryTable;
 use crate::core::schedule;
 use crate::core::sst::build_table;
-use crate::core::version::{Compaction, FileMetaData, Version, VersionEdit, VersionSet};
+use crate::core::version::{FileMetaData, Version, VersionEdit, VersionSet};
 use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
+use crate::table::builder::TableBuilder;
 
 struct Agent {
     batch: WriteBatch,
@@ -28,6 +33,7 @@ struct Agent {
 #[derive(Clone)]
 pub struct Database {
     db_impl: Arc<Mutex<DatabaseImpl>>,
+    has_imm: Arc<AtomicBool>,
     dispatcher: schedule::Dispatcher,
     background_work_finished_signal: Arc<Condvar>,
 }
@@ -43,6 +49,7 @@ impl Database {
     pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
         Ok(Self {
             db_impl: Arc::new(Mutex::new(DatabaseImpl::new(path.as_ref(), options)?)),
+            has_imm: Arc::new(AtomicBool::new(false)),
             dispatcher: schedule::Dispatcher::new(),
             background_work_finished_signal: Arc::new(Condvar::new()),
         })
@@ -228,6 +235,7 @@ impl Database {
                     }
                 }
 
+                self.has_imm.store(true, Ordering::Release);
                 database.immutable = Some(database.mutable.clone());
                 database.mutable = Arc::new(MemoryTable::new());
                 self.maybe_schedule_compaction();
@@ -237,12 +245,153 @@ impl Database {
     }
 
     fn maybe_schedule_compaction(&self) {
-        let database = self.db_impl.clone();
-        let background_work_finished_signal = self.background_work_finished_signal.clone();
+        let database = self.clone();
         self.dispatcher.dispatch(Box::new(move || {
-            DatabaseImpl::background_compaction(database);
-            background_work_finished_signal.notify_all();
+            database.background_compaction();
+            database.background_work_finished_signal.notify_all();
         }));
+    }
+
+    fn background_compaction(&self) {
+        if self.db_impl.lock().immutable.is_some() {
+            self.compact_memory_table();
+            return;
+        }
+
+        let mut db = self.db_impl.lock();
+        if let Some(mut compaction) = db.versions.pick_compaction() {
+            if compaction.is_trivial_move() {
+                let level = compaction.level;
+                let file = compaction.inputs[0][0].clone();
+                compaction.edit.remove_file(level, file.number);
+                compaction.edit.add_file(level + 1, file.as_ref().clone());
+                db.versions.log_and_apply(compaction.edit).unwrap();
+                log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, db.versions.level_summary());
+            } else {
+                let mut compact = CompactionState::new(&mut compaction);
+                compact.smallest_snapshot = db.versions.get_last_sequence();
+                let input = db.versions.make_input_iterator(compact.compaction);
+
+                drop(db);
+                self.do_compaction_work(&mut compact, &input);
+            }
+        }
+    }
+
+    fn compact_memory_table(&self) {
+        let mut db = self.db_impl.lock();
+        if db.immutable.is_none() {
+            return;
+        }
+
+        let table = db.immutable.as_ref().unwrap().clone();
+        let base = db.versions.latest_version();
+        let file_number = db.versions.get_new_file_number();
+        let options = db.options;
+        let db_name = String::from(db.name.as_str());
+        let log_file_number = db.log_file_number;
+
+        drop(db);
+
+        let result = DatabaseImpl::write_level0_table(options, db_name.as_str(), Some(&base), file_number, &table);
+        if result.is_err() {
+            return;
+        }
+
+        let (level, meta, spend_time) = result.unwrap();
+        let file_size = meta.file_size;
+        let mut edit = VersionEdit::new();
+        edit.set_prev_log_number(0);
+        edit.set_log_number(log_file_number);
+        edit.add_file(level, meta);
+
+        let mut db = self.db_impl.lock();
+        db.stats[level].add(spend_time, 0, file_size);
+
+        let status = db.versions.log_and_apply(edit);
+        if status.is_ok() {
+            self.has_imm.store(false, Ordering::Release);
+            db.immutable = None;
+            db.remove_obsolete_files();
+        }
+    }
+
+    fn do_compaction_work(&self, compact: &mut CompactionState, input: &MergingIterator) {
+        let mut result = Ok(());
+        let mut last_sequence_for_key = MAX_SEQUENCE_NUMBER;
+        let mut current_user_key: Option<Vec<u8>> = None;
+
+        input.seek_to_first();
+        while input.is_valid() {
+            if self.has_imm.load(Ordering::Relaxed) {
+                self.compact_memory_table();
+                self.background_work_finished_signal.notify_all();
+            }
+
+            let internal_key = InternalKey::from(input.key());
+            if compact.compaction.should_stop_before(&internal_key) && compact.table_builder.is_some() {
+                result = compact.finish_compaction_output_file();
+                if result.is_err() { break; }
+            }
+
+            let mut drop = false;
+            let first_occurrence = match &current_user_key {
+                Some(key) => UserKey::compare(key, &internal_key.extract_user_key()).is_ne(),
+                None => true
+            };
+            if first_occurrence {
+                current_user_key = Some(internal_key.extract_user_key().to_vec());
+                last_sequence_for_key = MAX_SEQUENCE_NUMBER;
+            }
+
+            if last_sequence_for_key <= compact.smallest_snapshot {
+                drop = true;
+            } else if internal_key.extract_value_type() == ValueType::Deletion &&
+                internal_key.extract_sequence() <= compact.smallest_snapshot &&
+                compact.compaction.is_base_level_for_key(&internal_key.extract_user_key())
+            {
+                drop = true;
+            }
+
+            last_sequence_for_key = internal_key.extract_sequence();
+
+            if !drop {
+                if compact.table_builder.is_none() {
+                    result = self.open_compaction_output_file(compact);
+                    if result.is_err() { break; }
+                }
+
+                if compact.add_key(&internal_key, input.value()) >= compact.compaction.get_max_output_file_size() {
+                    result = compact.finish_compaction_output_file();
+                    if result.is_err() { break; }
+                }
+            }
+            input.next();
+        }
+
+        if result.is_ok() && compact.table_builder.is_some() {
+            result = compact.finish_compaction_output_file();
+        }
+    }
+
+    fn open_compaction_output_file(&self, compact: &mut CompactionState) -> io::Result<()> {
+        let file_number;
+        let path;
+        let options;
+        {
+            let mut db = self.db_impl.lock();
+            file_number = db.versions.get_new_file_number();
+            path = db.name.clone();
+            options = db.options;
+        }
+
+        let file_name = filename::make_table_file_name(path.as_ref(), file_number);
+        let mut file_meta = FileMetaData::new();
+        file_meta.number = file_number;
+        compact.outputs.push(file_meta);
+        compact.table_builder = Some(TableBuilder::new(options, WritableFile::open(&file_name)?));
+
+        Ok(())
     }
 }
 
@@ -254,6 +403,7 @@ struct DatabaseImpl {
     mutable: Arc<MemoryTable>,
     immutable: Option<Arc<MemoryTable>>,
     versions: VersionSet,
+    stats: [CompactionStatistics; logs::NUM_LEVELS],
     agents: LinkedList<Arc<Agent>>,
 }
 
@@ -270,6 +420,7 @@ impl DatabaseImpl {
             mutable: Arc::new(MemoryTable::new()),
             immutable: None,
             versions: VersionSet::new(path, options),
+            stats: Default::default(),
             agents: LinkedList::new(),
         };
 
@@ -410,7 +561,8 @@ impl DatabaseImpl {
             if new_table.memory_usage() > self.options.write_buffer_size {
                 compactions += 1;
                 let new_number = self.versions.get_new_file_number();
-                let (level, file_meta) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
+                let (level, file_meta, spend_time) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
+                self.stats[level].add(spend_time, 0, file_meta.file_size);
                 edit.add_file(level, file_meta);
 
                 new_table = Arc::new(MemoryTable::new());
@@ -424,69 +576,16 @@ impl DatabaseImpl {
 
         if new_table.memory_usage() > 0 {
             let new_number = self.versions.get_new_file_number();
-            let (level, file_meta) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
+            let (level, file_meta, spend_time) = Self::write_level0_table(self.options, self.name.as_str(), None, new_number, &new_table)?;
+            self.stats[level].add(spend_time, 0, file_meta.file_size);
             edit.add_file(level, file_meta);
         }
 
         Ok(max_sequence)
     }
 
-    fn background_compaction(database: Arc<Mutex<Self>>) {
-        if database.lock().immutable.is_some() {
-            Self::compact_memory_table(database);
-            return;
-        }
-
-        let mut db = database.lock();
-        if let Some(mut compaction) = db.versions.pick_compaction() {
-            if compaction.is_trivial_move() {
-                let level = compaction.level;
-                let file = compaction.inputs[0][0].clone();
-                compaction.edit.remove_file(level, file.number);
-                compaction.edit.add_file(level + 1, file.as_ref().clone());
-                db.versions.log_and_apply(compaction.edit).unwrap();
-                log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, db.versions.level_summary());
-            } else {
-                db.do_compaction_work(&compaction);
-            }
-        }
-    }
-
-    fn do_compaction_work(&self, compaction: &Compaction) {
-        let _ = self.versions.make_input_iterator(compaction);
-    }
-
-    fn compact_memory_table(database: Arc<Mutex<Self>>) {
-        let mut db = database.lock();
-        let table = db.immutable.as_ref().unwrap().clone();
-        let base = db.versions.latest_version();
-        let file_number = db.versions.get_new_file_number();
-        let options = db.options;
-        let db_name = String::from(db.name.as_str());
-        let log_file_number = db.log_file_number;
-
-        drop(db);
-
-        let result = Self::write_level0_table(options, db_name.as_str(), Some(&base), file_number, &table);
-        if result.is_err() {
-            return;
-        }
-
-        let (level, meta) = result.unwrap();
-        let mut edit = VersionEdit::new();
-        edit.set_prev_log_number(0);
-        edit.set_log_number(log_file_number);
-        edit.add_file(level, meta);
-
-        let mut db = database.lock();
-        let status = db.versions.log_and_apply(edit);
-        if status.is_ok() {
-            db.immutable = None;
-            db.remove_obsolete_files();
-        }
-    }
-
-    fn write_level0_table(options: Options, db_name: &str, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData)> {
+    fn write_level0_table(options: Options, db_name: &str, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData, u64)> {
+        let begin_micros = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros();
         log::info!("level-0 table {}:started", file_number);
 
         let meta = build_table(options, db_name, table.iter(), file_number)?;
@@ -502,7 +601,8 @@ impl DatabaseImpl {
                 level = version.pick_level_for_memory_table(&min_user_key, &max_user_key);
             }
         }
-        Ok((level, meta))
+        let end_micros = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros();
+        Ok((level, meta, (end_micros - begin_micros) as u64))
     }
 
     fn remove_obsolete_files(&self) {
