@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::time::SystemTime;
 use crate::utils::coding;
 
 #[derive(Clone, Default)]
@@ -66,4 +67,8 @@ pub fn hash(data: &[u8], seed: u32) -> u32 {
         _ => {}
     };
     h
+}
+
+pub fn now_micros() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros() as u64
 }

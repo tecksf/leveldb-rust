@@ -778,7 +778,7 @@ impl VersionSet {
         }
     }
 
-    pub fn log_and_apply(&mut self, mut edit: VersionEdit) -> io::Result<()> {
+    pub fn log_and_apply(&mut self, edit: &mut VersionEdit) -> io::Result<()> {
         if edit.log_number.is_none() {
             edit.set_log_number(self.log_number);
         }

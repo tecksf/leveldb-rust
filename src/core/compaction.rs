@@ -111,6 +111,8 @@ pub struct CompactionState<'a> {
     pub table_builder: Option<TableBuilder<WritableFile>>,
     pub smallest_snapshot: u64,
     pub outputs: Vec<FileMetaData>,
+    pub stats: CompactionStatistics,
+    pub total_bytes: u64,
 }
 
 impl<'a> CompactionState<'a> {
@@ -120,12 +122,24 @@ impl<'a> CompactionState<'a> {
             table_builder: None,
             smallest_snapshot: 0,
             outputs: Default::default(),
+            stats: Default::default(),
+            total_bytes: 0,
         }
     }
 
     pub fn finish_compaction_output_file(&mut self) -> io::Result<()> {
+        if self.table_builder.is_none() || self.outputs.is_empty() {
+            return Ok(());
+        }
+
         let mut builder = self.table_builder.take().unwrap();
-        builder.finish()
+        let result = builder.finish();
+
+        let current_bytes = builder.file_size();
+        self.total_bytes += current_bytes;
+        self.outputs.last_mut().unwrap().file_size = current_bytes;
+
+        result
     }
 
     pub fn add_key<T: AsRef<[u8]>>(&mut self, internal_key: &InternalKey, value: T) -> u64 {

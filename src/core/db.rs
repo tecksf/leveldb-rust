@@ -21,6 +21,7 @@ use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
 use crate::table::builder::TableBuilder;
+use crate::utils::common::now_micros;
 
 struct Agent {
     batch: WriteBatch,
@@ -71,7 +72,7 @@ impl Database {
         if edit.has_updated() || edit.get_log_number().is_none() {
             edit.set_prev_log_number(0);
             edit.set_log_number(db.log_file_number);
-            db.versions.log_and_apply(edit)?;
+            db.versions.log_and_apply(&mut edit)?;
         }
 
         db.remove_obsolete_files();
@@ -286,7 +287,7 @@ impl Database {
     }
 
     fn background_compaction(&self) {
-        if self.db_impl.lock().immutable.is_some() {
+        if self.has_imm.load(Ordering::Acquire) {
             self.compact_memory_table();
             return;
         }
@@ -298,7 +299,7 @@ impl Database {
                 let file = compaction.inputs[0][0].clone();
                 compaction.edit.remove_file(level, file.number);
                 compaction.edit.add_file(level + 1, file.as_ref().clone());
-                db.versions.log_and_apply(compaction.edit).unwrap();
+                db.versions.log_and_apply(&mut compaction.edit).unwrap();
                 log::info!("Moved {0} to level{1} {2} bytes: {3}", file.number, level + 1, file.file_size, db.versions.level_summary());
             } else {
                 let mut compact = CompactionState::new(&mut compaction);
@@ -339,7 +340,7 @@ impl Database {
         let mut db = self.db_impl.lock();
         db.stats[level].add(spend_time, 0, file_size);
 
-        let status = db.versions.log_and_apply(edit);
+        let status = db.versions.log_and_apply(&mut edit);
         if status.is_ok() {
             self.has_imm.store(false, Ordering::Release);
             db.immutable = None;
@@ -348,6 +349,8 @@ impl Database {
     }
 
     fn do_compaction_work(&self, compact: &mut CompactionState, input: &MergingIterator) {
+        let start_micros = now_micros();
+        let mut imm_micros = 0;
         let mut result = Ok(());
         let mut last_sequence_for_key = MAX_SEQUENCE_NUMBER;
         let mut current_user_key: Option<Vec<u8>> = None;
@@ -355,8 +358,10 @@ impl Database {
         input.seek_to_first();
         while input.is_valid() {
             if self.has_imm.load(Ordering::Relaxed) {
+                let imm_start = now_micros();
                 self.compact_memory_table();
                 self.background_work_finished_signal.notify_all();
+                imm_micros += now_micros() - imm_start;
             }
 
             let internal_key = InternalKey::from(input.key());
@@ -403,6 +408,23 @@ impl Database {
         if result.is_ok() && compact.table_builder.is_some() {
             result = compact.finish_compaction_output_file();
         }
+
+        let spend_time = now_micros() - imm_micros - start_micros;
+        let mut bytes_read = 0;
+        let mut bytes_written = 0;
+        for which in 0..2 {
+            for i in 0..compact.compaction.inputs[which].len() {
+                bytes_read += compact.compaction.inputs[which][i].file_size;
+            }
+        }
+        for i in 0..compact.outputs.len() {
+            bytes_written += compact.outputs[i].file_size;
+        }
+        compact.stats.add(spend_time, bytes_read, bytes_written);
+
+        if result.is_ok() {
+            result = self.install_compaction_results(compact);
+        }
     }
 
     fn open_compaction_output_file(&self, compact: &mut CompactionState) -> io::Result<()> {
@@ -419,6 +441,29 @@ impl Database {
         compact.table_builder = Some(TableBuilder::new(self.options, WritableFile::open(&file_name)?));
 
         Ok(())
+    }
+
+    fn install_compaction_results(&self, compact: &mut CompactionState) -> io::Result<()> {
+        log::info!("Compacted {}@{} + {}@{} files => {} bytes",
+            compact.compaction.inputs[0].len(), compact.compaction.level,
+            compact.compaction.inputs[1].len(), compact.compaction.level + 1,
+            compact.total_bytes
+        );
+
+        let level = compact.compaction.level;
+        for which in 0..2 {
+            for input in &compact.compaction.inputs[which] {
+                compact.compaction.edit.remove_file(compact.compaction.level + which, input.number);
+            }
+        }
+
+        for output in &compact.outputs {
+            compact.compaction.edit.add_file(level + 1, output.clone());
+        }
+
+        let mut db = self.db_impl.lock();
+        db.stats[compact.compaction.level + 1].add_by(&compact.stats);
+        db.versions.log_and_apply(&mut compact.compaction.edit)
     }
 }
 
