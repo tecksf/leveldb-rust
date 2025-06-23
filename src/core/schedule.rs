@@ -51,15 +51,17 @@ impl Dispatcher {
     }
 
     pub fn terminate(&self) {
+        let cron_clone = self.cron.clone();
+        self.dispatch(Box::new(move || {
+            let mut cron = cron_clone.lock().unwrap();
+            cron.alive = false;
+        }));
         let background_thread;
         {
             let mut cron = self.cron.lock().unwrap();
-            cron.alive = false;
             background_thread = cron.background_thread.take();
         }
-        self.background_thread_cv.notify_one();
         if let Some(handle) = background_thread {
-            log::info!("Waiting background work finish...");
             handle.join().unwrap();
         }
     }
@@ -92,14 +94,14 @@ mod tests {
         let result = Arc::new(Mutex::new(0));
         let dispatcher = Dispatcher::new();
 
-        for i in 0..10 {
+        for _ in 0..10 {
             let number = result.clone();
             dispatcher.dispatch(Box::new(move || {
                 let mut num = number.lock().unwrap();
                 *num += 10;
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
         dispatcher.terminate();
         assert_eq!(*result.lock().unwrap(), 100);
         assert!(dispatcher.cron.lock().unwrap().background_thread.is_none());

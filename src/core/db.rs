@@ -1,6 +1,7 @@
 use std::{fs, io, time};
 use std::collections::LinkedList;
 use std::ffi::OsString;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,23 +34,27 @@ struct Agent {
 
 #[derive(Clone)]
 pub struct Database {
-    name: String,
-    options: Options,
-    db_impl: Arc<Mutex<DatabaseImpl>>,
-    has_imm: Arc<AtomicBool>,
     dispatcher: schedule::Dispatcher,
-    background_work_finished_signal: Arc<Condvar>,
+    db_wrap: DatabaseWrap,
+}
+
+impl Deref for Database {
+    type Target = DatabaseWrap;
+    fn deref(&self) -> &Self::Target {
+        &self.db_wrap
+    }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
+        log::info!("Terminates background thread, waiting all tasks finish...");
         self.dispatcher.terminate();
-        log::info!("Database Closed");
+        log::info!("Database Closed {:?}", self.name);
     }
 }
 
 impl Database {
-    pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Self> {
+    pub fn open<T: AsRef<str>>(path: T, options: Options) -> io::Result<Arc<Self>> {
         log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
         log::info!("Opening database at path: {}", path.as_ref());
 
@@ -79,29 +84,31 @@ impl Database {
 
         drop(db);
 
-        Ok(Self {
-            name: String::from(path.as_ref()),
-            options,
-            db_impl,
-            has_imm: Arc::new(AtomicBool::new(false)),
+        Ok(Arc::new(Self {
             dispatcher: schedule::Dispatcher::new(),
-            background_work_finished_signal: Arc::new(Condvar::new()),
-        })
+            db_wrap: DatabaseWrap {
+                name: String::from(path.as_ref()),
+                options,
+                db_impl,
+                has_imm: Arc::new(AtomicBool::new(false)),
+                background_work_finished_signal: Arc::new(Condvar::new()),
+            },
+        }))
     }
 
-    pub fn put<T: AsRef<str>>(&self, options: WriteOptions, key: T, value: T) -> io::Result<()> {
+    pub fn put<T: AsRef<str>>(self: &Arc<Self>, options: WriteOptions, key: T, value: T) -> io::Result<()> {
         let mut batch = WriteBatch::new();
         batch.put(key, value);
         self.write(options, batch)
     }
 
-    pub fn delete<T: AsRef<str>>(&self, options: WriteOptions, key: T) -> io::Result<()> {
+    pub fn delete<T: AsRef<str>>(self: &Arc<Self>, options: WriteOptions, key: T) -> io::Result<()> {
         let mut batch = WriteBatch::new();
         batch.delete(key);
         self.write(options, batch)
     }
 
-    pub fn write(&self, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
+    pub fn write(self: &Arc<Self>, options: WriteOptions, batch: WriteBatch) -> io::Result<()> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let current_agent = Arc::new(Agent {
             batch,
@@ -173,7 +180,7 @@ impl Database {
         result
     }
 
-    pub fn get<T: AsRef<str>>(&self, key: T) -> io::Result<Vec<u8>> {
+    pub fn get<T: AsRef<str>>(self: &Arc<Self>, key: T) -> io::Result<Vec<u8>> {
         let db_impl = self.db_impl.lock();
         let sequence = db_impl.versions.get_last_sequence();
         let version = db_impl.versions.latest_version();
@@ -249,10 +256,11 @@ impl Database {
             } else if database.mutable.memory_usage() <= database.options.write_buffer_size {
                 break;
             } else if database.immutable.is_some() {
-                log::info!("current memory table is full, waiting...\n");
+                log::info!("current memory table is full, waiting...");
                 self.background_work_finished_signal.wait(&mut database);
+                log::info!("resume memory table operation...");
             } else if database.versions.num_level_files(0) >= logs::L0_STOP_WRITES_TRIGGER {
-                log::info!("too many L0 files, waiting...\n");
+                log::info!("too many L0 files, waiting...");
                 self.background_work_finished_signal.wait(&mut database);
             } else {
                 let new_log_number = database.versions.get_new_file_number();
@@ -279,13 +287,24 @@ impl Database {
     }
 
     fn maybe_schedule_compaction(&self) {
-        let database = self.clone();
+        let database = self.db_wrap.clone();
         self.dispatcher.dispatch(Box::new(move || {
             database.background_compaction();
             database.background_work_finished_signal.notify_all();
         }));
     }
+}
 
+#[derive(Clone)]
+pub struct DatabaseWrap {
+    name: String,
+    options: Options,
+    db_impl: Arc<Mutex<DatabaseImpl>>,
+    has_imm: Arc<AtomicBool>,
+    background_work_finished_signal: Arc<Condvar>,
+}
+
+impl DatabaseWrap {
     fn background_compaction(&self) {
         if self.has_imm.load(Ordering::Acquire) {
             self.compact_memory_table();
