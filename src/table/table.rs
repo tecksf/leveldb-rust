@@ -160,3 +160,35 @@ impl<T: RandomReaderView> Table<T> {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs};
+    use std::path::Path;
+    use crate::core::iterator::LevelIterator;
+    use crate::logs::file;
+    use crate::Options;
+    use crate::table::table::Table;
+
+    #[test]
+    fn test_table_seek_by_iterator() {
+        let mut root_dir = env::current_dir().expect("Failed to get root dir");
+        root_dir.push("data\\000005.ldb");
+
+        let file_path = Path::new(&root_dir);
+        let file_size = fs::metadata(file_path).unwrap().len();
+        let file = file::ReadableFile::open(file_path).unwrap();
+
+        let table = Table::open(Options::default(), file, file_size).unwrap();
+        let iter = table.iter();
+
+        let mut number = 0;
+        iter.seek_to_first();
+        while iter.is_valid() {
+            assert_eq!(format!("l1-{:05}", number + 1), String::from_utf8(iter.value()).unwrap());
+            iter.next();
+            number += 1;
+        }
+        assert_eq!(number, 100)
+    }
+}

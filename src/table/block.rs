@@ -87,8 +87,8 @@ impl BlockIterator {
             data,
             restart_offset,
             num_restarts,
-            restart_index: Cell::new(num_restarts),
-            entry_offset: Cell::new(restart_offset),
+            restart_index: Cell::new(0),
+            entry_offset: Cell::new(0),
             key: RefCell::new(Vec::new()),
             value: RefCell::new(Vec::new()),
             compare,
@@ -103,7 +103,17 @@ impl BlockIterator {
     }
 
     fn get_restart_point(&self, index: usize) -> usize {
+        if index >= self.num_restarts {
+            return self.restart_offset;
+        }
         coding::decode_fixed32(&self.data[(self.restart_offset + index * 4)..]) as usize
+    }
+
+    fn seek_to_restart_point(&self, index: usize) {
+        self.restart_index.set(index);
+        self.entry_offset.set(self.get_restart_point(index));
+        self.key.borrow_mut().clear();
+        self.value.borrow_mut().clear();
     }
 
     fn decode_entry(data: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
@@ -139,13 +149,15 @@ impl BlockIterator {
     }
 
     fn parse_next_key(&self) -> bool {
+        self.entry_offset.set(self.entry_offset.get() + self.value.borrow().len());
+
         if !self.is_valid() {
-            self.entry_offset.set(self.restart_offset);
-            self.restart_index.set(self.num_restarts);
+            self.seek_to_restart_point(self.num_restarts);
             return false;
         }
 
-        let entry = &self.data[self.entry_offset.get()..];
+        let current_offset = self.entry_offset.get();
+        let entry = &self.data[current_offset..];
         if let Some((shared_len, non_shared_len, value_len, rest)) = Self::decode_entry(entry) {
             let mut key = self.key.borrow_mut();
             key.truncate(shared_len);
@@ -153,7 +165,16 @@ impl BlockIterator {
             let mut value = self.value.borrow_mut();
             value.clear();
             value.extend_from_slice(&rest[non_shared_len..non_shared_len + value_len]);
-            self.entry_offset.set(self.entry_offset.get() + entry.len() - rest.len() + non_shared_len + value_len);
+
+            while self.restart_index.get() + 1 < self.num_restarts {
+                let restart_point = self.get_restart_point(self.restart_index.get() + 1);
+                if restart_point >= current_offset {
+                    break;
+                }
+                self.restart_index.set(self.restart_index.get() + 1);
+            }
+
+            self.entry_offset.set(current_offset + entry.len() - rest.len() + non_shared_len);
             return true;
         }
 
@@ -182,8 +203,9 @@ impl LevelIterator for BlockIterator {
         let mut left = 0;
         let mut right = self.num_restarts - 1;
 
+        let mut result = Ordering::Equal;
         if self.is_valid() {
-            let result = (self.compare)(self.key.borrow().as_slice(), target);
+            result = (self.compare)(self.key.borrow().as_slice(), target);
             if result.is_lt() {
                 left = self.restart_index.get();
             } else if result.is_gt() {
@@ -204,20 +226,19 @@ impl LevelIterator for BlockIterator {
                 }
 
                 let mid_key = &rest[..non_shared_len];
-                let result = (self.compare)(mid_key, target);
-                if result.is_lt() {
+                if (self.compare)(mid_key, target).is_lt() {
                     left = mid;
-                } else if result.is_gt() {
-                    right = mid - 1;
                 } else {
-                    left = mid;
-                    break;
+                    right = mid - 1;
                 }
             }
         }
 
-        self.restart_index.set(left);
-        self.entry_offset.set(self.get_restart_point(left));
+        let skip_seek = left == self.restart_index.get() && result.is_lt();
+        if !skip_seek {
+            self.seek_to_restart_point(left);
+        }
+
         while self.parse_next_key() {
             if (self.compare)(self.key.borrow().as_slice(), target).is_ge() {
                 return true;
@@ -227,10 +248,8 @@ impl LevelIterator for BlockIterator {
     }
 
     fn seek_to_first(&self) {
-        self.restart_index.set(self.num_restarts);
-        self.entry_offset.set(self.restart_offset);
-        self.key.borrow_mut().clear();
-        self.value.borrow_mut().clear();
+        self.seek_to_restart_point(0);
+        self.parse_next_key();
     }
 
     fn seek_to_last(&self) {
@@ -367,16 +386,27 @@ mod tests {
     fn test_block_retrieve_key() {
         let block = Block::new(create_block_data()).unwrap();
         let iter = block.iter(UserKey::compare);
-        assert!(!iter.seek("abc".as_bytes()));
-        assert!(iter.seek("1234".as_bytes()));
-        assert_eq!(iter.value(), "Data002".as_bytes());
-
-        let expected = ["Data003", "Data004", "Data005", "Data006", "Data007", "Data008"];
         let mut index = 0;
+        let expected = ["Data001", "Data002", "Data003", "Data004", "Data005", "Data006", "Data007", "Data008"];
+
         while iter.next() {
             assert_eq!(iter.value(), expected[index].as_bytes());
             index += 1;
         }
+        assert_eq!(index, expected.len());
+
+        assert!(!iter.seek("abc".as_bytes()));
+        assert!(iter.seek("1234".as_bytes()));
+        assert_eq!(iter.value(), "Data002".as_bytes());
+
+        index = 0;
+        iter.seek_to_first();
+        while iter.is_valid() {
+            assert_eq!(iter.value(), expected[index].as_bytes());
+            iter.next();
+            index += 1;
+        }
+        assert_eq!(index, expected.len());
 
         assert!(iter.seek("123bcd".as_bytes()));
         assert_eq!(iter.value(), "Data006".as_bytes());
