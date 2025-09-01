@@ -85,16 +85,17 @@ impl Comparator for UserKey<'_> {
     }
 
     fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
+        let mut ans = Vec::from(self.payload);
         let min_length = std::cmp::min(self.len(), other.len());
         let mut diff_index = 0;
         while diff_index < min_length && self.payload[diff_index] == other.payload[diff_index] {
             diff_index += 1;
         }
 
-        let mut ans = Vec::from(&self.payload[..diff_index]);
         if diff_index < min_length {
             let diff_byte = self.payload[diff_index];
             if diff_byte < 0xff && diff_byte + 1 < other.payload[diff_index] {
+                ans.truncate(diff_index);
                 ans.push(diff_byte + 1);
             }
         }
@@ -239,24 +240,29 @@ impl Comparator for InternalKey {
     fn find_shortest_separator(&self, other: &Self) -> Vec<u8> {
         let start = self.extract_user_key();
         let limit = other.extract_user_key();
-
-        // tmp: ad
-        // start: abc
         let mut tmp = start.find_shortest_separator(&limit);
-        let tmp_user_key = UserKey::new(&tmp);
-        if tmp.len() < start.len() && start.cmp(&tmp_user_key) == Ordering::Less {
-            coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(MAX_SEQUENCE_NUMBER, INSERTION_TYPE_FOR_SEEK));
+
+        debug_assert!(start.cmp(&UserKey::new(&tmp)).is_le());
+
+        let mut sequence = self.extract_sequence();
+        if tmp.len() < start.len() {
+            sequence = MAX_SEQUENCE_NUMBER;
         }
+        coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(sequence, INSERTION_TYPE_FOR_SEEK));
         tmp
     }
 
     fn find_shortest_successor(&self) -> Vec<u8> {
         let user_key = self.extract_user_key();
         let mut tmp = user_key.find_shortest_successor();
-        let tmp_user_key = UserKey::new(&tmp);
-        if tmp_user_key.len() < user_key.len() && user_key.cmp(&tmp_user_key).is_lt() {
-            coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(MAX_SEQUENCE_NUMBER, INSERTION_TYPE_FOR_SEEK));
+
+        debug_assert!(user_key.cmp(&UserKey::new(&tmp)).is_le());
+
+        let mut sequence = self.extract_sequence();
+        if tmp.len() < user_key.len() {
+            sequence = MAX_SEQUENCE_NUMBER;
         }
+        coding::put_fixed64_into_vec(&mut tmp, pack_sequence_and_type(sequence, INSERTION_TYPE_FOR_SEEK));
         tmp
     }
 }
@@ -340,37 +346,45 @@ impl From<Vec<u8>> for LookupKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{UserKey, InternalKey, Comparator, ValueType};
+    use super::{UserKey, InternalKey, Comparator, ValueType, MAX_SEQUENCE_NUMBER};
 
     #[test]
-    fn test_user_key_shortest_separator() {
-        let cases: [(&str, &str, &str); 3] = [
-            ("abc", "abk", "abd"),
-            ("1234", "123978", "1235"),
-            ("java", "javascript", "java"),
+    fn test_key_shortest_separator_create() {
+        let cases = [
+            ("abc", "abk", "abd", 100, 200, 100),
+            ("12345", "123978", "1235", 100, 200, MAX_SEQUENCE_NUMBER),
+            ("java", "javascript", "java", 100, 200, 100),
+            ("12345", "12346", "12345", 100, 200, 100),
         ];
 
-        for (key1, key2, expected) in cases {
+        for (key1, key2, expected, s1, s2, s) in cases {
             let user_key1 = UserKey::new(key1);
             let user_key2 = UserKey::new(key2);
             assert_eq!(user_key1.find_shortest_separator(&user_key2), expected.as_bytes());
+
+            let internal_key1 = InternalKey::restore(key1, s1, ValueType::Insertion);
+            let internal_key2 = InternalKey::restore(key2, s2, ValueType::Insertion);
+            let expected_internal_key = InternalKey::restore(expected, s, ValueType::Insertion);
+            assert_eq!(internal_key1.find_shortest_separator(&internal_key2), expected_internal_key.as_ref());
         }
     }
 
     #[test]
-    fn test_user_key_shortest_successor() {
-        let cases: [(&str, &str); 2] = [
-            ("abc", "b"),
-            ("123", "2"),
+    fn test_key_shortest_successor_create() {
+        let cases = [
+            ("abc".as_bytes(), "b".as_bytes(), 100, MAX_SEQUENCE_NUMBER),
+            ("123".as_bytes(), "2".as_bytes(), 100, MAX_SEQUENCE_NUMBER),
+            ([0xff, 0x01].as_slice(), [0xff, 0x02].as_slice(), 100, 100),
         ];
 
-        for (key, expected) in cases {
+        for (key, expected, s1, s) in cases {
             let user_key = UserKey::new(key);
-            assert_eq!(user_key.find_shortest_successor(), expected.as_bytes());
-        }
+            assert_eq!(user_key.find_shortest_successor(), expected);
 
-        let user_key = UserKey::new([0xff, 0x01].as_slice());
-        assert_eq!(user_key.find_shortest_successor(), [0xff, 0x02]);
+            let internal_key = InternalKey::restore(key, s1, ValueType::Insertion);
+            let expected_internal_key = InternalKey::restore(expected, s, ValueType::Insertion);
+            assert_eq!(internal_key.find_shortest_successor(), expected_internal_key.as_ref());
+        }
     }
 
     #[test]

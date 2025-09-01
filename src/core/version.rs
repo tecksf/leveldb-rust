@@ -1117,10 +1117,13 @@ impl VersionSet {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::sync::Arc;
-    use crate::core::format::{InternalKey, UserKey, ValueType};
+    use crate::core::cache::TableCache;
+    use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
+    use crate::core::iterator::{LevelIterator, MergingIterator, TwoLevelIterator};
     use crate::Options;
-    use super::{FileMetaData, Version, VersionBuilder, VersionEdit, VersionSet};
+    use super::{FileIteratorGen, FileMetaData, Version, VersionBuilder, VersionEdit, VersionLevelFileIterator, VersionSet};
 
     fn create_file_meta<T: AsRef<[u8]>>(number: u64, key1: T, key2: T) -> FileMetaData {
         let mut meta = FileMetaData::new();
@@ -1292,5 +1295,54 @@ mod tests {
         let new_version = builder.generate_new_version();
         assert_eq!(new_version.files[0].len(), 1);
         assert_eq!(new_version.files[1].len(), 1);
+    }
+
+    #[test]
+    fn test_level_file_number_iterator() {
+        let mut db_path = env::current_dir().expect("Failed to get root dir");
+        db_path.push("data");
+        let f6 = Arc::new(FileMetaData {
+            number: 6,
+            file_size: 2367,
+            smallest: InternalKey::restore("00200", 2000, ValueType::Insertion),
+            largest: InternalKey::restore("00300", 2100, ValueType::Insertion),
+            ..Default::default()
+        });
+        let f7 = Arc::new(FileMetaData {
+            number: 7,
+            file_size: 2367,
+            smallest: InternalKey::restore("00400", 1500, ValueType::Insertion),
+            largest: InternalKey::restore("00500", 1600, ValueType::Insertion),
+            ..Default::default()
+        });
+        let f3 = Arc::new(FileMetaData {
+            number: 3,
+            file_size: 7876,
+            smallest: InternalKey::restore("00250", 1000, ValueType::Insertion),
+            largest: InternalKey::restore("00600", 1350, ValueType::Insertion),
+            ..Default::default()
+        });
+
+        let table_cache = Arc::new(TableCache::new(db_path.to_str().unwrap(), Options::default()));
+        let iter1 = TwoLevelIterator::new(
+            VersionLevelFileIterator::new(vec![f6, f7]),
+            FileIteratorGen::new(table_cache.clone()),
+        );
+
+        let iter2 = TwoLevelIterator::new(
+            VersionLevelFileIterator::new(vec![f3]),
+            FileIteratorGen::new(table_cache.clone()),
+        );
+
+        let iter = MergingIterator::new(InternalKey::compare, vec![Box::new(iter1), Box::new(iter2)]);
+        let mut number = 0;
+        iter.seek_to_first();
+        while iter.is_valid() {
+            let value = String::from_utf8(iter.value()).unwrap();
+            println!("{:?}", value);
+            iter.next();
+            number += 1;
+        }
+        assert_eq!(number, 553);
     }
 }

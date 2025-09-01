@@ -173,7 +173,8 @@ mod tests {
     #[test]
     fn test_table_seek_by_iterator() {
         let mut root_dir = env::current_dir().expect("Failed to get root dir");
-        root_dir.push("data\\000005.ldb");
+        root_dir.push("data");
+        root_dir.push("000005.ldb");
 
         let file_path = Path::new(&root_dir);
         let file_size = fs::metadata(file_path).unwrap().len();

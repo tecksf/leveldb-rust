@@ -105,7 +105,8 @@ impl<Iter, Gen> LevelIterator for TwoLevelIterator<Iter, Gen>
                 iter.seek(target);
             }
         }
-        false
+        self.skip_empty_data_blocks_forward();
+        self.is_valid()
     }
 
     fn seek_to_first(&self) {
@@ -256,6 +257,10 @@ mod tests {
                 index: Cell::new(0),
             }
         }
+
+        fn decode_data(&self, text: &[u8]) -> usize {
+            text.iter().position(|&x| x == b'-').unwrap()
+        }
     }
 
     impl LevelIterator for DataIterator {
@@ -264,11 +269,15 @@ mod tests {
         }
 
         fn key(&self) -> Vec<u8> {
-            Vec::from(self.data[self.index.get()].as_bytes())
+            let text = self.data[self.index.get()].as_bytes();
+            let sep = self.decode_data(text);
+            Vec::from(&text[..sep])
         }
 
         fn value(&self) -> Vec<u8> {
-            self.key()
+            let text = self.data[self.index.get()].as_bytes();
+            let sep = self.decode_data(text);
+            Vec::from(&text[sep + 1..])
         }
 
         fn next(&self) -> bool {
@@ -277,8 +286,10 @@ mod tests {
         }
 
         fn seek(&self, target: &[u8]) -> bool {
-            let result = self.data.binary_search_by(|key| {
-                key.as_bytes().cmp(target)
+            let result = self.data.binary_search_by(|text| {
+                let sep = self.decode_data(text.as_bytes());
+                let key = &text.as_bytes()[..sep];
+                key.cmp(target)
             });
 
             self.index.set(result.unwrap_or_else(|n| n));
@@ -317,35 +328,55 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_iterators_merged() {
-        let d1 = Box::new(DataIterator::new(vec!["123", "abc", "opq"]));
-        let d2 = Box::new(DataIterator::new(vec!["789", "efg", "lmn"]));
-        let d3 = Box::new(DataIterator::new(vec!["145", "189", "def"]));
-        let d4 = Box::new(DataIterator::new(vec!["123", "456", "789"]));
-
-        let mut result = Vec::new();
-        let iterator = MergingIterator::new(|x, y| { x.cmp(y) }, vec![d1, d2, d3, d4]);
-        iterator.seek_to_first();
-        while iterator.is_valid() {
-            let key = iterator.key();
-            result.push(String::from_utf8(key).unwrap());
-            iterator.next();
-        }
-        assert_eq!(result, vec!["123", "145", "189", "456", "789", "abc", "def", "efg", "lmn", "opq"]);
-    }
-
-    #[test]
     fn test_two_level_iterator_seek() {
-        let index_iterator = DataIterator::new(vec!["3", "0", "6"]);
-        let generator = DataIteratorGen::new(vec!["100", "200", "300", "400", "500", "600", "700", "800", "900"]);
+        let index_iterator = DataIterator::new(vec!["400-3", "100-0", "700-6"]);
+        let generator = DataIteratorGen::new(
+            vec!["100-v100", "200-v200", "300-v300", "400-v400",
+                 "500-v500", "600-v600", "700-v700", "800-v800", "900-v900"]
+        );
         let iterator = TwoLevelIterator::new(index_iterator, generator);
         let mut result = Vec::new();
         iterator.seek_to_first();
         while iterator.is_valid() {
-            let key = iterator.key();
-            result.push(String::from_utf8(key).unwrap());
+            result.push(String::from_utf8(iterator.value()).unwrap());
             iterator.next();
         }
-        assert_eq!(result, vec!["400", "500", "600", "100", "200", "300", "700", "800", "900"]);
+        assert_eq!(result, vec!["v400", "v500", "v600", "v100", "v200", "v300", "v700", "v800", "v900"]);
+    }
+
+    #[test]
+    fn test_multi_iterators_merged() {
+        let it1 = Box::new(DataIterator::new(vec!["100-v100", "200-v200", "300-v300"]));
+        let it2 = Box::new(DataIterator::new(vec!["150-v150", "250-v250", "350-v350"]));
+        let it3 = Box::new(DataIterator::new(vec!["180-v180", "280-v280", "380-v380"]));
+
+        let d4 = DataIterator::new(vec!["500-0", "503-3", "506-6"]);
+        let g4 = DataIteratorGen::new(
+            vec!["500-v500", "501-v501", "502-v502", "503-v503", "504-v504", "505-v505", "506-v506", "507-v507", "508-v508"]
+        );
+        let it4 = Box::new(TwoLevelIterator::new(d4, g4));
+
+        let d5 = DataIterator::new(vec!["600-0", "603-3", "606-6"]);
+        let g5 = DataIteratorGen::new(
+            vec!["600-v600", "601-v601", "602-v602", "603-v603", "604-v604", "605-v605", "606-v606", "607-v607", "608-v608"]
+        );
+        let it5 = Box::new(TwoLevelIterator::new(d5, g5));
+
+        let expected = [
+            100, 150, 180, 200, 250, 280, 300, 350, 380,
+            500, 501, 502, 503, 504, 505, 506, 507, 508,
+            600, 601, 602, 603, 604, 605, 606, 607, 608
+        ];
+        let mut index = 0;
+
+        let iterator = MergingIterator::new(|x, y| { x.cmp(y) }, vec![it1, it2, it3, it4, it5]);
+        iterator.seek_to_first();
+        while iterator.is_valid() {
+            let value = String::from_utf8(iterator.value()).unwrap();
+            assert_eq!(value, format!("v{}", expected[index]));
+            iterator.next();
+            index += 1;
+        }
+        assert_eq!(index, 27);
     }
 }
