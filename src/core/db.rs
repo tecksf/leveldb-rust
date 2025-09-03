@@ -5,7 +5,6 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
 use crossbeam_channel::internal::SelectHandle;
 use parking_lot::{Mutex, Condvar, MutexGuard};
 use fslock::LockFile;
@@ -644,7 +643,7 @@ impl DatabaseImpl {
     }
 
     fn write_level0_table(options: Options, db_name: &str, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData, u64)> {
-        let begin_micros = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros();
+        let start_micros = now_micros();
         log::info!("level-0 table {}:started", file_number);
 
         let meta = build_table(options, db_name, table.iter(), file_number)?;
@@ -660,8 +659,8 @@ impl DatabaseImpl {
                 level = version.pick_level_for_memory_table(&min_user_key, &max_user_key);
             }
         }
-        let end_micros = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros();
-        Ok((level, meta, (end_micros - begin_micros) as u64))
+
+        Ok((level, meta, now_micros() - start_micros))
     }
 
     fn remove_obsolete_files(&self) {
@@ -687,5 +686,87 @@ impl DatabaseImpl {
         for filename in files_to_delete {
             fs::remove_file(Path::new(&self.name).join(filename)).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use parking_lot::{Condvar, Mutex};
+    use tempfile::tempdir;
+    use crate::core::compaction::{Compaction, CompactionState};
+    use crate::core::db::{DatabaseImpl, DatabaseWrap};
+    use crate::core::format::{InternalKey, Comparator, UserKey};
+    use crate::core::iterator::{LevelIterator, MergingIterator};
+    use crate::logs::file;
+    use crate::Options;
+    use crate::table::table::Table;
+
+    #[test]
+    fn test_db_size_compaction() {
+        let root_path = env::current_dir().expect("Failed to get root dir");
+        let options = Options::default();
+
+        let mut iterator_list: Vec<Box<dyn LevelIterator>> = Vec::new();
+        for i in [3, 6, 7] {
+            let file_path = root_path.join("data").join(format!("{:06}.ldb", i));
+            let file_size = fs::metadata(&file_path).unwrap().len();
+            let file = file::ReadableFile::open(file_path).unwrap();
+            let table = Table::open(options, file, file_size).unwrap();
+            iterator_list.push(table.iter());
+        }
+        let iterator = MergingIterator::new(InternalKey::compare, iterator_list);
+
+        let tmp_dir = tempdir().unwrap();
+        let db_path = tmp_dir.path().join("leveldb");
+        fs::create_dir(&db_path).unwrap_or_default();
+
+        let db_impl = DatabaseImpl::new(&db_path.to_str().unwrap(), options);
+        let version = db_impl.versions.latest_version();
+        let db_wrap = DatabaseWrap {
+            name: db_impl.name.clone(),
+            options,
+            db_impl: Arc::new(Mutex::new(db_impl)),
+            has_imm: Arc::new(AtomicBool::new(false)),
+            background_work_finished_signal: Arc::new(Condvar::new()),
+        };
+        let mut compaction = Compaction::new(options, version, 1);
+        let mut compaction_state = CompactionState::new(&mut compaction);
+        compaction_state.smallest_snapshot = 5000;
+        db_wrap.do_compaction_work(&mut compaction_state, &iterator);
+
+        let file_path = db_path.join("000002.ldb");
+        let file_size = fs::metadata(&file_path).unwrap().len();
+        let file = file::ReadableFile::open(file_path).unwrap();
+        let table = Table::open(Options::default(), file, file_size).unwrap();
+        let iter = table.iter();
+        let mut number = 0;
+        let mut last_user_key = Vec::new();
+        iter.seek_to_first();
+        while iter.is_valid() {
+            let (key, value) = (iter.key(), iter.value());
+            let internal_key = InternalKey::from(key.clone());
+            let user_key = internal_key.extract_user_key();
+
+            assert!(user_key > UserKey::new(&last_user_key));
+
+            let raw_key = String::from_utf8(user_key.to_vec()).unwrap();
+            let raw_value = String::from_utf8(value).unwrap();
+
+            if (user_key >= UserKey::new("00200") && user_key <= UserKey::new("00300")) ||
+                (user_key >= UserKey::new("00400") && user_key <= UserKey::new("00500")) {
+                assert_eq!(format!("l1-{}", raw_key), raw_value);
+            } else {
+                assert_eq!(format!("l2-{}", raw_key), raw_value);
+            }
+
+            last_user_key = user_key.to_vec();
+
+            iter.next();
+            number += 1;
+        }
+        assert_eq!(number, 401);
     }
 }
