@@ -814,6 +814,16 @@ impl VersionSet {
         Ok(())
     }
 
+    pub fn needs_compaction(&self) -> bool {
+        let current = self.latest_version();
+        if current.compaction_score >= 1.0 {
+            return true;
+        } else if let Ok(c) = current.file_to_compact.read() {
+            return c.is_some();
+        }
+        false
+    }
+
     pub fn add_live_files(&self) -> BTreeSet<u64> {
         let mut live = BTreeSet::<u64>::new();
         for version in &self.versions {

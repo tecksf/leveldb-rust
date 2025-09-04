@@ -83,16 +83,13 @@ impl Database {
 
         drop(db);
 
-        Ok(Arc::new(Self {
+        let database = Database {
             dispatcher: schedule::Dispatcher::new(),
-            db_wrap: DatabaseWrap {
-                name: String::from(path.as_ref()),
-                options,
-                db_impl,
-                has_imm: Arc::new(AtomicBool::new(false)),
-                background_work_finished_signal: Arc::new(Condvar::new()),
-            },
-        }))
+            db_wrap: DatabaseWrap::new(String::from(path.as_ref()), options, db_impl),
+        };
+        database.schedule_compaction();
+
+        Ok(Arc::new(database))
     }
 
     pub fn put<T: AsRef<str>>(self: &Arc<Self>, options: WriteOptions, key: T, value: T) -> io::Result<()> {
@@ -279,16 +276,27 @@ impl Database {
                 self.has_imm.store(true, Ordering::Release);
                 database.immutable = Some(database.mutable.clone());
                 database.mutable = Arc::new(MemoryTable::new());
-                self.maybe_schedule_compaction();
+                self.schedule_compaction();
             }
         }
         Ok(())
     }
 
-    fn maybe_schedule_compaction(&self) {
+    fn schedule_compaction(&self) {
         let database = self.db_wrap.clone();
-        self.dispatcher.dispatch(Box::new(move || {
+        if database.maybe_schedule_compaction() {
+            Self::background_call(database, self.dispatcher.clone());
+        }
+    }
+
+    fn background_call(database: DatabaseWrap, dispatcher: schedule::Dispatcher) {
+        let dispatcher_ = dispatcher.clone();
+        dispatcher_.dispatch(Box::new(move || {
             database.background_compaction();
+
+            if database.maybe_schedule_compaction() {
+                Self::background_call(database.clone(), dispatcher);
+            }
             database.background_work_finished_signal.notify_all();
         }));
     }
@@ -301,12 +309,38 @@ pub struct DatabaseWrap {
     db_impl: Arc<Mutex<DatabaseImpl>>,
     has_imm: Arc<AtomicBool>,
     background_work_finished_signal: Arc<Condvar>,
+    background_compaction_scheduled: Arc<AtomicBool>,
 }
 
 impl DatabaseWrap {
+    fn new(name: String, options: Options, db_impl: Arc<Mutex<DatabaseImpl>>) -> Self {
+        Self {
+            name,
+            options,
+            db_impl,
+            has_imm: Arc::new(AtomicBool::new(false)),
+            background_work_finished_signal: Arc::new(Condvar::new()),
+            background_compaction_scheduled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn maybe_schedule_compaction(&self) -> bool {
+        if self.background_compaction_scheduled.load(Ordering::Relaxed) {
+            return false;
+        } else if !self.has_imm.load(Ordering::Acquire) {
+            let db = self.db_impl.lock();
+            if !db.versions.needs_compaction() {
+                return false;
+            }
+        }
+        self.background_compaction_scheduled.store(true, Ordering::Relaxed);
+        true
+    }
+
     fn background_compaction(&self) {
         if self.has_imm.load(Ordering::Acquire) {
             self.compact_memory_table();
+            self.background_compaction_scheduled.store(false, Ordering::Relaxed);
             return;
         }
 
@@ -328,6 +362,7 @@ impl DatabaseWrap {
                 self.do_compaction_work(&mut compact, &input);
             }
         }
+        self.background_compaction_scheduled.store(false, Ordering::Relaxed);
     }
 
     fn compact_memory_table(&self) {
@@ -693,8 +728,7 @@ impl DatabaseImpl {
 mod tests {
     use std::{env, fs};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use parking_lot::{Condvar, Mutex};
+    use parking_lot::Mutex;
     use tempfile::tempdir;
     use crate::core::compaction::{Compaction, CompactionState};
     use crate::core::db::{DatabaseImpl, DatabaseWrap};
@@ -725,13 +759,7 @@ mod tests {
 
         let db_impl = DatabaseImpl::new(&db_path.to_str().unwrap(), options);
         let version = db_impl.versions.latest_version();
-        let db_wrap = DatabaseWrap {
-            name: db_impl.name.clone(),
-            options,
-            db_impl: Arc::new(Mutex::new(db_impl)),
-            has_imm: Arc::new(AtomicBool::new(false)),
-            background_work_finished_signal: Arc::new(Condvar::new()),
-        };
+        let db_wrap = DatabaseWrap::new(db_impl.name.clone(), options, Arc::new(Mutex::new(db_impl)));
         let mut compaction = Compaction::new(options, version, 1);
         let mut compaction_state = CompactionState::new(&mut compaction);
         compaction_state.smallest_snapshot = 5000;
