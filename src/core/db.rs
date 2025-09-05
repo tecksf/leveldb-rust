@@ -87,7 +87,7 @@ impl Database {
             dispatcher: schedule::Dispatcher::new(),
             db_wrap: DatabaseWrap::new(String::from(path.as_ref()), options, db_impl),
         };
-        database.schedule_compaction();
+        database.maybe_schedule_compaction();
 
         Ok(Arc::new(database))
     }
@@ -242,7 +242,7 @@ impl Database {
         while !rx.is_empty() {
             if db_impl.manual_compaction.is_none() {
                 db_impl.manual_compaction = Some(manual.clone());
-                self.schedule_compaction();
+                self.maybe_schedule_compaction();
             } else {
                 self.background_work_finished_signal.wait(&mut db_impl)
             }
@@ -314,15 +314,15 @@ impl Database {
                 self.has_imm.store(true, Ordering::Release);
                 database.immutable = Some(database.mutable.clone());
                 database.mutable = Arc::new(MemoryTable::new());
-                self.schedule_compaction();
+                self.maybe_schedule_compaction();
             }
         }
         Ok(())
     }
 
-    fn schedule_compaction(&self) {
+    fn maybe_schedule_compaction(&self) {
         let database = self.db_wrap.clone();
-        if database.maybe_schedule_compaction() {
+        if database.match_compaction_condition() {
             Self::background_call(database, self.dispatcher.clone());
         }
     }
@@ -332,7 +332,7 @@ impl Database {
         dispatcher_.dispatch(Box::new(move || {
             database.background_compaction();
 
-            if database.maybe_schedule_compaction() {
+            if database.match_compaction_condition() {
                 Self::background_call(database.clone(), dispatcher);
             }
             database.background_work_finished_signal.notify_all();
@@ -362,7 +362,7 @@ impl DatabaseWrap {
         }
     }
 
-    fn maybe_schedule_compaction(&self) -> bool {
+    fn match_compaction_condition(&self) -> bool {
         if self.background_compaction_scheduled.load(Ordering::Relaxed) {
             return false;
         } else if !self.has_imm.load(Ordering::Acquire) {
