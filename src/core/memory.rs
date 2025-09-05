@@ -1,9 +1,8 @@
-use std::cell::{Cell, RefCell};
-use std::cmp::Ordering;
 use std::io;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use rand::Rng;
+use typed_arena::Arena;
 use crate::core::batch::WriteBatch;
 use crate::core::format;
 use crate::core::format::{LookupKey, ValueType};
@@ -11,76 +10,94 @@ use crate::utils::coding;
 
 const MAX_HEIGHT: usize = 12;
 
-enum Link<T> {
-    Ptr(Rc<RefCell<T>>),
-    Nil,
-}
-
 struct Node<T> {
     key: T,
-    next: Vec<Link<Node<T>>>,
-}
-
-type LinkedNode<T> = Link<Node<T>>;
-
-impl<T> Clone for LinkedNode<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Link::Ptr(p) => Link::Ptr(p.clone()),
-            _ => Link::Nil
-        }
-    }
+    next: [AtomicPtr<Node<T>>; MAX_HEIGHT],
 }
 
 impl<T> Node<T> {
-    fn new(key: T, height: usize) -> Self {
-        Self { key, next: vec![Link::Nil; height] }
+    fn new(key: T) -> Self {
+        Self {
+            key,
+            next: Default::default(),
+        }
     }
 
-    fn set_next(&mut self, level: usize, node: LinkedNode<T>) {
-        self.next[level] = node;
+    fn get_next(&self, level: usize) -> *mut Node<T> {
+        self.next[level].load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn get_next(&self, level: usize) -> LinkedNode<T> {
-        self.next[level].clone()
+    fn set_next(&mut self, level: usize, node: *mut Node<T>) {
+        self.next[level].store(node, std::sync::atomic::Ordering::Release);
+    }
+
+    fn get_next_without_barrier(&self, level: usize) -> *mut Node<T> {
+        self.next[level].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_next_without_barrier(&mut self, level: usize, node: *mut Node<T>) {
+        self.next[level].store(node, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 struct SkipList<T> {
-    head: LinkedNode<T>,
+    head: *mut Node<T>,
+    arena: Arena<Node<T>>,
 }
 
 impl<T> SkipList<T> where T: Default + Ord {
-    pub fn new() -> Self {
-        let root = Rc::new(RefCell::new(Node::new(T::default(), MAX_HEIGHT)));
-        for i in 0..MAX_HEIGHT {
-            root.borrow_mut().set_next(i, Link::Nil);
+    fn new() -> Self {
+        let arena = Arena::new();
+        let head = arena.alloc(Node::new(T::default()));
+        Self {
+            head,
+            arena,
         }
-
-        Self { head: Link::Ptr(root) }
     }
 
-    pub fn insert(&self, key: T) {
-        let mut prev = vec![Link::Nil; MAX_HEIGHT];
-        if let Link::Ptr(_) = self.find(&key, prev.as_mut_slice()) {
+    fn new_node(&self, key: T) -> &mut Node<T> {
+        self.arena.alloc(Node::new(key))
+    }
+
+    fn insert(&self, key: T) {
+        let mut prev: [*mut Node<T>; MAX_HEIGHT] = [std::ptr::null_mut(); MAX_HEIGHT];
+        if self.find(&key, &mut prev) {
             return;
         }
 
-        let height = SkipList::<T>::get_random_height();
-        let new_node = Rc::new(RefCell::new(Node::<T>::new(key, height)));
-        for i in 0..height {
-            if let Link::Ptr(ptr) = &prev[i] {
-                new_node.borrow_mut().set_next(i, ptr.borrow().get_next(i));
-                ptr.borrow_mut().set_next(i, Link::Ptr(new_node.clone()));
+        let height = Self::get_random_height();
+        let node = self.new_node(key);
+        for level in 0..height {
+            unsafe {
+                node.set_next_without_barrier(level, (*prev[level]).get_next_without_barrier(level));
+                (*prev[level]).set_next(level, node);
             }
         }
     }
 
     pub fn contains(&self, key: &T) -> bool {
-        if let Link::Ptr(_) = self.find(key, &mut []) {
-            return true;
+        let mut prev: [*mut Node<T>; MAX_HEIGHT] = [std::ptr::null_mut(); MAX_HEIGHT];
+        self.find(key, &mut prev)
+    }
+
+    fn find(&self, key: &T, prev: &mut [*mut Node<T>; MAX_HEIGHT]) -> bool {
+        let mut node = self.head;
+        let mut level = MAX_HEIGHT - 1;
+        unsafe {
+            loop {
+                let next = (*node).get_next(level);
+                if !next.is_null() && key.cmp(&(*next).key).is_ge() {
+                    node = next;
+                } else {
+                    prev[level] = node;
+                    if level == 0 {
+                        break;
+                    }
+                    level -= 1;
+                }
+            }
+            !prev[0].is_null() && key.cmp(&(*prev[0]).key).is_eq()
         }
-        false
     }
 
     fn get_random_height() -> usize {
@@ -91,37 +108,10 @@ impl<T> SkipList<T> where T: Default + Ord {
         }
         height
     }
-
-    fn find(&self, key: &T, prev: &mut [LinkedNode<T>]) -> LinkedNode<T> {
-        let mut current: LinkedNode<T> = self.head.clone();
-
-        for index in (0..MAX_HEIGHT).rev() {
-            while let Link::Ptr(rc1) = &current {
-                let target = rc1.borrow().get_next(index);
-                match &target {
-                    Link::Ptr(rc2)
-                    if rc2.borrow().key.cmp(key).is_le() => {
-                        current = target;
-                    }
-                    _ => break
-                }
-            }
-            if index < prev.len() {
-                prev[index] = current.clone();
-            }
-        }
-
-        if let Link::Ptr(rc) = &current {
-            if key.cmp(&rc.borrow().key) == Ordering::Equal {
-                return current.clone();
-            }
-        }
-        Link::Nil
-    }
 }
 
 pub struct SkipListIterator<'a, T> {
-    current: LinkedNode<T>,
+    next: *mut Node<T>,
     marker: PhantomData<&'a T>,
 }
 
@@ -129,13 +119,11 @@ impl<'a, T> Iterator for SkipListIterator<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.current.clone();
-        if let Link::Ptr(rc) = current {
-            let next = rc.borrow().get_next(0);
-            self.current = next;
+        let current = self.next;
+        if !current.is_null() {
             unsafe {
-                let node = &*rc.as_ptr();
-                return Some(&node.key);
+                self.next = (*current).get_next(0);
+                return Some(&(*current).key);
             }
         }
         None
@@ -147,14 +135,15 @@ impl<'a, T> IntoIterator for &'a SkipList<T> {
     type IntoIter = SkipListIterator<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut start: LinkedNode<T> = Link::Nil;
-        if let Link::Ptr(rc) = &self.head {
-            start = rc.borrow().get_next(0);
+        let mut next: *mut Node<T> = std::ptr::null_mut();
+        if !self.head.is_null() {
+            unsafe {
+                next = (*self.head).get_next(0);
+            }
         }
-
-        SkipListIterator {
-            current: start,
-            marker: Default::default(),
+        Self::IntoIter {
+            next,
+            marker: PhantomData,
         }
     }
 }
@@ -163,8 +152,7 @@ pub type MemoryTableIterator<'a> = SkipListIterator<'a, LookupKey>;
 
 pub struct MemoryTable {
     table: SkipList<LookupKey>,
-    usage: Cell<usize>,
-    refs: Cell<u32>,
+    usage: AtomicUsize,
 }
 
 unsafe impl Send for MemoryTable {}
@@ -174,8 +162,7 @@ impl MemoryTable {
     pub fn new() -> Self {
         Self {
             table: SkipList::new(),
-            usage: Cell::new(0),
-            refs: Cell::new(0),
+            usage: AtomicUsize::new(0),
         }
     }
 
@@ -187,7 +174,7 @@ impl MemoryTable {
     }
 
     pub fn memory_usage(&self) -> usize {
-        self.usage.get()
+        self.usage.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn iter(&self) -> MemoryTableIterator {
@@ -211,28 +198,21 @@ impl MemoryTable {
         buf.extend_from_slice(value);
 
         self.table.insert(LookupKey::from(buf));
-        self.usage.set(self.usage.get() + encoded_length);
+        self.usage.fetch_add(encoded_length, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get(&self, lookup_key: &LookupKey) -> io::Result<Option<Vec<u8>>> {
-        let mut prev = vec![Link::Nil; MAX_HEIGHT];
-        let link_node = match self.table.find(&lookup_key, prev.as_mut_slice()) {
-            Link::Ptr(p) => Link::Ptr(p),
-            Link::Nil => {
-                if let Link::Ptr(p1) = &prev[0] {
-                    if let Link::Ptr(p2) = p1.borrow().get_next(0) {
-                        Link::Ptr(p2)
-                    } else {
-                        Link::Nil
-                    }
-                } else {
-                    Link::Nil
-                }
-            }
-        };
+        let mut prev = [std::ptr::null_mut(); MAX_HEIGHT];
+        let mut ptr: *mut Node<LookupKey> = std::ptr::null_mut();
+        if self.table.find(&lookup_key, &mut prev) {
+            ptr = prev[0];
+        } else if !prev[0].is_null() {
+            unsafe { ptr = (*prev[0]).get_next(0); }
+        }
 
-        if let Link::Ptr(ptr) = link_node {
-            let seek_key = &ptr.borrow().key;
+        if !ptr.is_null() {
+            let seek_key: &LookupKey;
+            unsafe { seek_key = &(*ptr).key; }
             let key1 = seek_key.extract_internal_key();
             let key2 = lookup_key.extract_internal_key();
             if key1.extract_user_key() == key2.extract_user_key() {
