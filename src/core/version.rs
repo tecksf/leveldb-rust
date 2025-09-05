@@ -211,7 +211,7 @@ impl Version {
         user_key.cmp(&files[index].smallest.extract_user_key()).is_ge()
     }
 
-    fn overlap_in_level(&self, level: usize, smallest: &UserKey, largest: &UserKey) -> bool {
+    pub fn overlap_in_level(&self, level: usize, smallest: &UserKey, largest: &UserKey) -> bool {
         let files = &self.files[level];
         if level == 0 {
             let disjoint = files.iter().all(|f| {
@@ -1094,6 +1094,31 @@ impl VersionSet {
 
         self.get_other_inputs(&mut compaction);
 
+        Some(compaction)
+    }
+
+    pub fn compact_range(&mut self, level: usize, smallest: &InternalKey, largest: &InternalKey) -> Option<Compaction> {
+        let current = self.latest_version();
+        let mut inputs = current.get_over_lapping_inputs(level, smallest, largest);
+        if inputs.is_empty() {
+            return None;
+        }
+
+        if level > 0 {
+            let limit = threshold::target_file_size(&self.options);
+            let mut total = 0;
+            for (index, file) in inputs.iter().enumerate() {
+                total += file.file_size;
+                if total >= limit {
+                    inputs.truncate(index + 1);
+                    break;
+                }
+            }
+        }
+
+        let mut compaction = Compaction::new(self.options, current.clone(), level);
+        compaction.inputs[0] = inputs;
+        self.get_other_inputs(&mut compaction);
         Some(compaction)
     }
 

@@ -10,7 +10,7 @@ use parking_lot::{Mutex, Condvar, MutexGuard};
 use fslock::LockFile;
 use crate::{logs, Options, WriteOptions};
 use crate::core::batch::WriteBatch;
-use crate::core::compaction::{CompactionState, CompactionStatistics};
+use crate::core::compaction::{CompactionState, CompactionStatistics, ManualCompaction};
 use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey, ValueType, MAX_SEQUENCE_NUMBER};
 use crate::core::iterator::{LevelIterator, MergingIterator};
 use crate::core::memory::MemoryTable;
@@ -212,6 +212,44 @@ impl Database {
         result
     }
 
+    pub fn compact_range<T: AsRef<str>>(self: &Arc<Self>, begin: T, end: T) {
+        let mut max_level_with_files = 1;
+        {
+            let db_impl = self.db_impl.lock();
+            let current = db_impl.versions.latest_version();
+            for level in 1..logs::NUM_LEVELS {
+                if current.overlap_in_level(level, &UserKey::new(begin.as_ref()), &UserKey::new(end.as_ref())) {
+                    max_level_with_files = level;
+                }
+            }
+        }
+
+        for level in 0..max_level_with_files {
+            self.compact_range_for_test(level, begin.as_ref(), end.as_ref());
+        }
+    }
+
+    fn compact_range_for_test(self: &Arc<Self>, level: usize, begin: &str, end: &str) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let manual = Arc::new(ManualCompaction {
+            level,
+            begin: InternalKey::restore(begin, MAX_SEQUENCE_NUMBER, ValueType::Insertion),
+            end: InternalKey::restore(end, 0, ValueType::Deletion),
+            done: tx,
+        });
+
+        let mut db_impl = self.db_impl.lock();
+        while !rx.is_empty() {
+            if db_impl.manual_compaction.is_none() {
+                db_impl.manual_compaction = Some(manual.clone());
+                self.schedule_compaction();
+            } else {
+                self.background_work_finished_signal.wait(&mut db_impl)
+            }
+        }
+        db_impl.manual_compaction = None;
+    }
+
     fn build_batch_group(agents: &LinkedList<Arc<Agent>>, result: &mut WriteBatch) -> Arc<Agent> {
         let first = agents.front().unwrap().clone();
         let mut last = first.clone();
@@ -345,8 +383,15 @@ impl DatabaseWrap {
         }
 
         let mut db = self.db_impl.lock();
-        if let Some(mut compaction) = db.versions.pick_compaction() {
-            if compaction.is_trivial_move() {
+        let manual_compaction = db.manual_compaction.clone();
+        let compaction_proposal = if let Some(manual) = manual_compaction.clone() {
+            db.versions.compact_range(manual.level, &manual.begin, &manual.end)
+        } else {
+            db.versions.pick_compaction()
+        };
+
+        if let Some(mut compaction) = compaction_proposal {
+            if db.manual_compaction.is_none() && compaction.is_trivial_move() {
                 let level = compaction.level;
                 let file = compaction.inputs[0][0].clone();
                 compaction.edit.remove_file(level, file.number);
@@ -359,10 +404,14 @@ impl DatabaseWrap {
                 let input = db.versions.make_input_iterator(compact.compaction);
 
                 drop(db);
-                self.do_compaction_work(&mut compact, &input);
+                let _ = self.do_compaction_work(&mut compact, &input);
             }
         }
         self.background_compaction_scheduled.store(false, Ordering::Relaxed);
+
+        if let Some(manual) = manual_compaction {
+            manual.done.send(true).unwrap();
+        }
     }
 
     fn compact_memory_table(&self) {
@@ -401,7 +450,7 @@ impl DatabaseWrap {
         }
     }
 
-    fn do_compaction_work(&self, compact: &mut CompactionState, input: &MergingIterator) {
+    fn do_compaction_work(&self, compact: &mut CompactionState, input: &MergingIterator) -> io::Result<()> {
         let start_micros = now_micros();
         let mut imm_micros = 0;
         let mut result = Ok(());
@@ -478,6 +527,8 @@ impl DatabaseWrap {
         if result.is_ok() {
             result = self.install_compaction_results(compact);
         }
+
+        result
     }
 
     fn open_compaction_output_file(&self, compact: &mut CompactionState) -> io::Result<()> {
@@ -530,6 +581,7 @@ struct DatabaseImpl {
     versions: VersionSet,
     stats: [CompactionStatistics; logs::NUM_LEVELS],
     agents: LinkedList<Arc<Agent>>,
+    manual_compaction: Option<Arc<ManualCompaction>>,
 }
 
 impl DatabaseImpl {
@@ -544,6 +596,7 @@ impl DatabaseImpl {
             versions: VersionSet::new(path, options),
             stats: Default::default(),
             agents: LinkedList::new(),
+            manual_compaction: None,
         }
     }
 
@@ -763,7 +816,7 @@ mod tests {
         let mut compaction = Compaction::new(options, version, 1);
         let mut compaction_state = CompactionState::new(&mut compaction);
         compaction_state.smallest_snapshot = 5000;
-        db_wrap.do_compaction_work(&mut compaction_state, &iterator);
+        let _ = db_wrap.do_compaction_work(&mut compaction_state, &iterator);
 
         let file_path = db_path.join("000002.ldb");
         let file_size = fs::metadata(&file_path).unwrap().len();

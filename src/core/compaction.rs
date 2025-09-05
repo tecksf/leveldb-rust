@@ -192,3 +192,10 @@ impl Default for CompactionStatistics {
         Self::new()
     }
 }
+
+pub struct ManualCompaction {
+    pub level: usize,
+    pub begin: InternalKey,
+    pub end: InternalKey,
+    pub done: crossbeam_channel::Sender<bool>,
+}
