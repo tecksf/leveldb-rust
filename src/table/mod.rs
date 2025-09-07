@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod table;
-mod block;
+pub mod block;
+pub mod cache;
 
 const TABLE_MAGIC_NUMBER: u64 = 0xdb4775248b80fb57;
 const FILTER_BASE_LOG: usize = 11;

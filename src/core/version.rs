@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32};
 use crate::core::format;
 use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey};
 use crate::{logs, Options};
-use crate::core::cache::TableCache;
+use crate::table::cache::TableCache;
 use crate::core::compaction::{threshold, Compaction};
 use crate::core::iterator::{IteratorGen, LevelIterator, MergingIterator, TwoLevelIterator};
 use crate::logs::{file, filename, wal};
@@ -726,7 +726,7 @@ impl VersionSet {
             manifest_file_number: 0,
             manifest_logger: None,
             compact_pointers: Default::default(),
-            table_cache: Arc::new(TableCache::new(db_name, options)),
+            table_cache: Arc::new(TableCache::new(db_name, options, options.max_open_files - 10)),
         };
         set.versions.push_back(Arc::new(Version::new(&set)));
         set
@@ -1154,7 +1154,7 @@ impl VersionSet {
 mod tests {
     use std::env;
     use std::sync::Arc;
-    use crate::core::cache::TableCache;
+    use crate::table::cache::TableCache;
     use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
     use crate::core::iterator::{LevelIterator, MergingIterator, TwoLevelIterator};
     use crate::Options;
@@ -1358,7 +1358,7 @@ mod tests {
             ..Default::default()
         });
 
-        let table_cache = Arc::new(TableCache::new(db_path.to_str().unwrap(), Options::default()));
+        let table_cache = Arc::new(TableCache::new(db_path.to_str().unwrap(), Options::default(), 8));
         let iter1 = TwoLevelIterator::new(
             VersionLevelFileIterator::new(vec![f6, f7]),
             FileIteratorGen::new(table_cache.clone()),

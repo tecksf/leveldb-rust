@@ -5,6 +5,7 @@ use crate::{CompressionType, FilterPolicy, Options};
 use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
 use crate::core::iterator::{IteratorGen, LevelIterator, TwoLevelIterator};
 use crate::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
+use crate::table::cache::{BlockCache, BlockCacheKey};
 use crate::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::utils::coding;
 
@@ -13,6 +14,8 @@ pub struct Table<T> {
     file: Arc<T>,
     index_block: Block,
     filter: Option<Filter>,
+    block_cache: Option<Arc<BlockCache>>,
+    cache_id: u64,
 }
 
 pub struct BlockIteratorGen<T> {
@@ -39,7 +42,7 @@ impl<T: RandomReaderView> IteratorGen for BlockIteratorGen<T> {
 }
 
 impl<T: RandomReaderView> Table<T> {
-    pub fn open(options: Options, file: T, size: u64) -> io::Result<Self> {
+    pub fn open(options: Options, file: T, size: u64, cache_id: u64, block_cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
         let mut buffer = [0; Footer::ENCODED_LENGTH];
         file.read(size - Footer::ENCODED_LENGTH as u64, Footer::ENCODED_LENGTH, &mut buffer[..])?;
 
@@ -62,6 +65,8 @@ impl<T: RandomReaderView> Table<T> {
             file: Arc::new(file),
             index_block,
             filter,
+            block_cache,
+            cache_id,
         })
     }
 
@@ -70,7 +75,6 @@ impl<T: RandomReaderView> Table<T> {
         if index_iter.seek(internal_key.as_ref()) {
             let value = index_iter.value();
             let data_block_handle = BlockHandle::decode_from(value).map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
-            let data_block = self.read_data_block(&data_block_handle)?;
 
             if let Some(filter) = &self.filter {
                 if !filter.key_may_match(data_block_handle.offset, internal_key.as_ref()) {
@@ -78,6 +82,7 @@ impl<T: RandomReaderView> Table<T> {
                 }
             }
 
+            let data_block = self.read_data_block(&data_block_handle)?;
             let data_iter = data_block.iter(InternalKey::compare);
             if data_iter.seek(internal_key.as_ref()) {
                 let user_key = internal_key.extract_user_key();
@@ -111,6 +116,21 @@ impl<T: RandomReaderView> Table<T> {
     }
 
     fn read_data_block(&self, index_block_handle: &BlockHandle) -> io::Result<Block> {
+        if let Some(block_cache) = &self.block_cache {
+            let mut key: BlockCacheKey = Default::default();
+            coding::put_fixed64(&mut key, self.cache_id);
+            coding::put_fixed64(&mut key[8..], index_block_handle.offset as u64);
+
+            if let Some(block) = block_cache.lookup(&key) {
+                return Ok(block);
+            }
+
+            let result = Self::read_block(self.options.paranoid_checks, &self.file, index_block_handle)?;
+            let block = Block::new(result)?;
+            block_cache.add(key, block.clone());
+            return Ok(block);
+        }
+
         let result = Self::read_block(self.options.paranoid_checks, &self.file, index_block_handle)?;
         Block::new(result)
     }
@@ -180,7 +200,7 @@ mod tests {
         let file_size = fs::metadata(file_path).unwrap().len();
         let file = file::ReadableFile::open(file_path).unwrap();
 
-        let table = Table::open(Options::default(), file, file_size).unwrap();
+        let table = Table::open(Options::default(), file, file_size, 0, None).unwrap();
         let iter = table.iter();
 
         let mut number = 0;

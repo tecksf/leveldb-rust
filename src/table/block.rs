@@ -42,6 +42,7 @@ impl BlockHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct Block {
     data: Arc<Vec<u8>>,
     restart_offset: usize,

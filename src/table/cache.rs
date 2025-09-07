@@ -3,10 +3,12 @@ use std::hash::Hash;
 use std::{io, ptr};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::core::format::InternalKey;
 use crate::core::iterator::LevelIterator;
 use crate::Options;
 use crate::logs::{file, filename};
+use crate::table::block::Block;
 use crate::table::table::Table;
 use crate::utils::coding;
 use crate::utils::common::hash;
@@ -197,58 +199,76 @@ impl<K: Eq + Hash, V> LRUCache<K, V> {
     }
 }
 
-impl<K, V> Default for LRUCache<K, V> where K: Eq + Hash {
-    fn default() -> Self {
-        LRUCache::new(16)
-    }
+const NUM_SHARD_BITS: usize = 4;
+const NUM_SHARDS: usize = 1 << NUM_SHARD_BITS;
+
+pub trait HashKey: Hash {
+    fn hash_key(&self) -> u32;
 }
 
-type SSTable = Arc<Table<file::ReadableFile>>;
-type TableLRUCache = LRUCache<u64, SSTable>;
-
-struct ShardedLRUCache {
-    shard: [Mutex<TableLRUCache>; ShardedLRUCache::NUM_SHARDS],
+pub struct ShardedLRUCache<K, V> {
+    shard: [Mutex<LRUCache<K, V>>; NUM_SHARDS],
 }
 
-impl ShardedLRUCache {
-    const NUM_SHARD_BITS: usize = 4;
-    const NUM_SHARDS: usize = 1 << ShardedLRUCache::NUM_SHARD_BITS;
-
-    fn new() -> Self {
+impl<K, V> ShardedLRUCache<K, V> where K: Eq + HashKey, V: Clone {
+    pub fn new(capacity: usize) -> Self {
+        let per_shard_cap = (capacity + (NUM_SHARDS - 1)) / NUM_SHARDS;
         Self {
-            shard: Default::default(),
+            shard: std::array::from_fn(|_| Mutex::new(LRUCache::<K, V>::new(per_shard_cap))),
         }
     }
 
     fn shard(hash: u32) -> usize {
-        (hash as usize) >> (32 - ShardedLRUCache::NUM_SHARD_BITS)
+        (hash as usize) >> (32 - NUM_SHARD_BITS)
     }
 
-    fn lookup(&self, key: u64) -> Option<SSTable> {
-        let k = coding::encode_fixed64(key);
-        let slot = hash(&k, 0);
-        self.shard[Self::shard(slot)].lock().unwrap().lookup(&key).map(|t| t.clone())
+    pub fn lookup(&self, key: &K) -> Option<V> {
+        let slot = key.hash_key();
+        let mut cache = self.shard[Self::shard(slot)].lock().ok()?;
+        cache.lookup(key).map(|v| v.clone())
     }
 
-    fn add(&self, key: u64, table: SSTable) {
-        let k = coding::encode_fixed64(key);
-        let slot = hash(&k, 0);
-        self.shard[Self::shard(slot)].lock().unwrap().add(key, table);
+    pub fn add(&self, key: K, value: V) {
+        let slot = key.hash_key();
+        if let Ok(mut cache) = self.shard[Self::shard(slot)].lock() {
+            cache.add(key, value);
+        }
     }
 }
+
+pub type BlockCacheKey = [u8; 16];
+impl HashKey for BlockCacheKey {
+    fn hash_key(&self) -> u32 {
+        hash(self, 0)
+    }
+}
+
+impl HashKey for u64 {
+    fn hash_key(&self) -> u32 {
+        let k = coding::encode_fixed64(*self);
+        hash(&k, 0)
+    }
+}
+
+pub type BlockCache = ShardedLRUCache<BlockCacheKey, Block>;
+type SSTable = Arc<Table<file::ReadableFile>>;
 
 pub struct TableCache {
     db_name: String,
     options: Options,
-    cache: ShardedLRUCache,
+    cache: ShardedLRUCache<u64, SSTable>,
+    cache_id: AtomicU64,
+    block_cache: Option<Arc<BlockCache>>,
 }
 
 impl TableCache {
-    pub fn new(db_name: &str, options: Options) -> Self {
+    pub fn new(db_name: &str, options: Options, capacity: usize) -> Self {
         Self {
             options,
             db_name: String::from(db_name),
-            cache: ShardedLRUCache::new(),
+            cache: ShardedLRUCache::new(capacity),
+            cache_id: AtomicU64::new(0),
+            block_cache: options.enable_block_cache.then(|| { Arc::new(BlockCache::new(8 << 20)) }),
         }
     }
 
@@ -261,12 +281,12 @@ impl TableCache {
     }
 
     fn find_table(&self, file_number: u64, file_size: u64) -> io::Result<SSTable> {
-        if let Some(sst) = self.cache.lookup(file_number) {
+        if let Some(sst) = self.cache.lookup(&file_number) {
             Ok(sst.clone())
         } else {
             let table_file_name = filename::make_table_file_name(self.db_name.as_str(), file_number);
             let file = file::ReadableFile::open(table_file_name)?;
-            let table = Arc::new(Table::open(self.options, file, file_size)?);
+            let table = Arc::new(Table::open(self.options, file, file_size, self.new_id(), self.block_cache.clone())?);
             self.cache.add(file_number, table.clone());
             Ok(table)
         }
@@ -278,6 +298,10 @@ impl TableCache {
             iter = Some(table.iter());
         }
         iter
+    }
+
+    fn new_id(&self) -> u64 {
+        self.cache_id.fetch_add(1, Ordering::AcqRel)
     }
 }
 
