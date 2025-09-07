@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::logs::file::RandomReaderView;
 use crate::{CompressionType, FilterPolicy, Options};
 use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
@@ -8,6 +9,11 @@ use crate::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
 use crate::table::cache::{BlockCache, BlockCacheKey};
 use crate::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::utils::coding;
+
+static GLOBAL_BLOCK_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+fn new_id() -> u64 {
+    GLOBAL_BLOCK_CACHE_ID.fetch_add(1, Ordering::AcqRel)
+}
 
 pub struct Table<T> {
     options: Options,
@@ -19,15 +25,19 @@ pub struct Table<T> {
 }
 
 pub struct BlockIteratorGen<T> {
+    options: Options,
     file: Arc<T>,
-    paranoid_checks: bool,
+    block_cache: Option<Arc<BlockCache>>,
+    cache_id: u64,
 }
 
 impl<T: RandomReaderView> BlockIteratorGen<T> {
-    fn new(file: Arc<T>, paranoid_checks: bool) -> Self {
+    fn new(options: Options, file: Arc<T>, block_cache: Option<Arc<BlockCache>>, cache_id: u64) -> Self {
         Self {
+            options,
             file,
-            paranoid_checks,
+            block_cache,
+            cache_id,
         }
     }
 }
@@ -35,14 +45,13 @@ impl<T: RandomReaderView> BlockIteratorGen<T> {
 impl<T: RandomReaderView> IteratorGen for BlockIteratorGen<T> {
     fn gen(&self, data: &[u8]) -> Option<Box<dyn LevelIterator>> {
         let data_block_handle = BlockHandle::decode_from(data).ok()?;
-        let result = Table::<T>::read_block(self.paranoid_checks, &self.file, &data_block_handle).ok()?;
-        let block = Block::new(result).ok()?;
+        let block = Table::<T>::read_data_block(self.options, &self.file, &data_block_handle, &self.block_cache, self.cache_id).ok()?;
         Some(Box::new(block.iter(InternalKey::compare)))
     }
 }
 
 impl<T: RandomReaderView> Table<T> {
-    pub fn open(options: Options, file: T, size: u64, cache_id: u64, block_cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
+    pub fn open(options: Options, file: T, size: u64, block_cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
         let mut buffer = [0; Footer::ENCODED_LENGTH];
         file.read(size - Footer::ENCODED_LENGTH as u64, Footer::ENCODED_LENGTH, &mut buffer[..])?;
 
@@ -59,6 +68,8 @@ impl<T: RandomReaderView> Table<T> {
                 }
             }
         }
+
+        let cache_id = if block_cache.is_some() { new_id() } else { 0 };
 
         Ok(Self {
             options,
@@ -82,7 +93,7 @@ impl<T: RandomReaderView> Table<T> {
                 }
             }
 
-            let data_block = self.read_data_block(&data_block_handle)?;
+            let data_block = Self::read_data_block(self.options, &self.file, &data_block_handle, &self.block_cache, self.cache_id)?;
             let data_iter = data_block.iter(InternalKey::compare);
             if data_iter.seek(internal_key.as_ref()) {
                 let user_key = internal_key.extract_user_key();
@@ -111,27 +122,27 @@ impl<T: RandomReaderView> Table<T> {
     }
 
     pub fn iter(&self) -> Box<TwoLevelIterator<BlockIterator, BlockIteratorGen<T>>> {
-        let generator = BlockIteratorGen::<T>::new(self.file.clone(), self.options.paranoid_checks);
+        let generator = BlockIteratorGen::<T>::new(self.options, self.file.clone(), self.block_cache.clone(), self.cache_id);
         Box::new(TwoLevelIterator::new(self.index_block.iter(InternalKey::compare), generator))
     }
 
-    fn read_data_block(&self, index_block_handle: &BlockHandle) -> io::Result<Block> {
-        if let Some(block_cache) = &self.block_cache {
+    fn read_data_block(options: Options, file: &T, index_block_handle: &BlockHandle, block_cache: &Option<Arc<BlockCache>>, cache_id: u64) -> io::Result<Block> {
+        if let Some(cache) = &block_cache {
             let mut key: BlockCacheKey = Default::default();
-            coding::put_fixed64(&mut key, self.cache_id);
+            coding::put_fixed64(&mut key, cache_id);
             coding::put_fixed64(&mut key[8..], index_block_handle.offset as u64);
 
-            if let Some(block) = block_cache.lookup(&key) {
+            if let Some(block) = cache.lookup(&key) {
                 return Ok(block);
             }
 
-            let result = Self::read_block(self.options.paranoid_checks, &self.file, index_block_handle)?;
+            let result = Self::read_block(options.paranoid_checks, file, index_block_handle)?;
             let block = Block::new(result)?;
-            block_cache.add(key, block.clone());
+            cache.add(key, block.clone());
             return Ok(block);
         }
 
-        let result = Self::read_block(self.options.paranoid_checks, &self.file, index_block_handle)?;
+        let result = Self::read_block(options.paranoid_checks, file, index_block_handle)?;
         Block::new(result)
     }
 
@@ -200,7 +211,7 @@ mod tests {
         let file_size = fs::metadata(file_path).unwrap().len();
         let file = file::ReadableFile::open(file_path).unwrap();
 
-        let table = Table::open(Options::default(), file, file_size, 0, None).unwrap();
+        let table = Table::open(Options::default(), file, file_size, None).unwrap();
         let iter = table.iter();
 
         let mut number = 0;

@@ -3,7 +3,6 @@ use std::hash::Hash;
 use std::{io, ptr};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::core::format::InternalKey;
 use crate::core::iterator::LevelIterator;
 use crate::Options;
@@ -257,7 +256,6 @@ pub struct TableCache {
     db_name: String,
     options: Options,
     cache: ShardedLRUCache<u64, SSTable>,
-    cache_id: AtomicU64,
     block_cache: Option<Arc<BlockCache>>,
 }
 
@@ -267,7 +265,6 @@ impl TableCache {
             options,
             db_name: String::from(db_name),
             cache: ShardedLRUCache::new(capacity),
-            cache_id: AtomicU64::new(0),
             block_cache: options.enable_block_cache.then(|| { Arc::new(BlockCache::new(8 << 20)) }),
         }
     }
@@ -286,7 +283,7 @@ impl TableCache {
         } else {
             let table_file_name = filename::make_table_file_name(self.db_name.as_str(), file_number);
             let file = file::ReadableFile::open(table_file_name)?;
-            let table = Arc::new(Table::open(self.options, file, file_size, self.new_id(), self.block_cache.clone())?);
+            let table = Arc::new(Table::open(self.options, file, file_size, self.block_cache.clone())?);
             self.cache.add(file_number, table.clone());
             Ok(table)
         }
@@ -298,10 +295,6 @@ impl TableCache {
             iter = Some(table.iter());
         }
         iter
-    }
-
-    fn new_id(&self) -> u64 {
-        self.cache_id.fetch_add(1, Ordering::AcqRel)
     }
 }
 

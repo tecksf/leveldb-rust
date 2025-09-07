@@ -801,7 +801,7 @@ mod tests {
             let file_path = root_path.join("data").join(format!("{:06}.ldb", i));
             let file_size = fs::metadata(&file_path).unwrap().len();
             let file = file::ReadableFile::open(file_path).unwrap();
-            let table = Table::open(options, file, file_size, i, None).unwrap();
+            let table = Table::open(options, file, file_size, None).unwrap();
             iterator_list.push(table.iter());
         }
         let iterator = MergingIterator::new(InternalKey::compare, iterator_list);
@@ -821,7 +821,7 @@ mod tests {
         let file_path = db_path.join("000002.ldb");
         let file_size = fs::metadata(&file_path).unwrap().len();
         let file = file::ReadableFile::open(file_path).unwrap();
-        let table = Table::open(Options::default(), file, file_size, 2, None).unwrap();
+        let table = Table::open(Options::default(), file, file_size, None).unwrap();
         let iter = table.iter();
         let mut number = 0;
         let mut last_user_key = Vec::new();
