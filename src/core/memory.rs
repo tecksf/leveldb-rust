@@ -45,6 +45,9 @@ struct SkipList<T> {
     arena: Arena<Node<T>>,
 }
 
+unsafe impl<T> Send for SkipList<T> {}
+unsafe impl<T> Sync for SkipList<T> {}
+
 impl<T> SkipList<T> where T: Default + Ord {
     fn new() -> Self {
         let arena = Arena::new();
@@ -96,7 +99,7 @@ impl<T> SkipList<T> where T: Default + Ord {
                     level -= 1;
                 }
             }
-            !prev[0].is_null() && key.cmp(&(*prev[0]).key).is_eq()
+            node != self.head && !prev[0].is_null() && key.cmp(&(*prev[0]).key).is_eq()
         }
     }
 
@@ -154,9 +157,6 @@ pub struct MemoryTable {
     table: SkipList<LookupKey>,
     usage: AtomicUsize,
 }
-
-unsafe impl Send for MemoryTable {}
-unsafe impl Sync for MemoryTable {}
 
 impl MemoryTable {
     pub fn new() -> Self {
@@ -229,25 +229,30 @@ impl MemoryTable {
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::SliceRandom;
     use crate::core::format::{LookupKey, ValueType};
     use crate::core::memory::{MemoryTable, SkipList};
 
     #[test]
-    fn test_skip_list_insert_and_delete() {
+    fn test_skip_list_insert() {
         let list = SkipList::<i32>::new();
-        let data = [1, 34, 21, 6, 13, 4, 11, 39, 25];
+        let mut data: Vec<i32> = (0..1000).collect();
+        let mut rng = rand::thread_rng();
+        data.shuffle(&mut rng);
         for n in data {
             list.insert(n);
         }
-        assert_eq!(list.contains(&11), true);
-        assert_eq!(list.contains(&25), true);
-        assert_eq!(list.contains(&19), false);
 
-        let mut result = Vec::with_capacity(data.len());
+        assert_eq!(list.contains(&101), true);
+        assert_eq!(list.contains(&325), true);
+        assert_eq!(list.contains(&1900), false);
+
+        let mut i = 0;
         for &n in &list {
-            result.push(n);
+            assert_eq!(n, i);
+            i += 1;
         }
-        assert_eq!(result, vec![1, 4, 6, 11, 13, 21, 25, 34, 39]);
+        assert_eq!(i, 1000);
     }
 
     #[test]
