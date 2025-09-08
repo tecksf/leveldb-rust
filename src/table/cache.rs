@@ -8,6 +8,7 @@ use crate::core::iterator::LevelIterator;
 use crate::Options;
 use crate::logs::{file, filename};
 use crate::table::block::Block;
+use crate::table::{HashKey, Usage};
 use crate::table::table::Table;
 use crate::utils::coding;
 use crate::utils::common::hash;
@@ -153,17 +154,18 @@ struct LRUCache<K, V> {
     table: HashMap<K, Link<V>>,
     lru: LinkedList<V>,
     capacity: usize,
+    usage: usize,
 }
 
 unsafe impl<K, V> Send for LRUCache<K, V> {}
 
-impl<K: Eq + Hash, V> LRUCache<K, V> {
-    fn new(cap: usize) -> Self {
-        let capacity = if cap < 8 { 8 } else { cap };
+impl<K: Eq + Hash, V: Usage> LRUCache<K, V> {
+    fn new(capacity: usize) -> Self {
         Self {
-            table: HashMap::with_capacity(capacity),
+            table: HashMap::new(),
             lru: LinkedList::new(),
             capacity,
+            usage: 0,
         }
     }
 
@@ -186,12 +188,14 @@ impl<K: Eq + Hash, V> LRUCache<K, V> {
             return;
         }
 
-        if self.table.len() == self.capacity {
+        if self.usage >= self.capacity {
             let link = self.lru.pop_front().unwrap();
             self.table.retain(|_, v| *v != link);
             Node::release(link);
+            unsafe { self.usage -= (*link).value.usage(); }
         }
 
+        self.usage += value.usage();
         let link = Node::new_link(value);
         self.table.insert(key, link);
         self.lru.push_back(link);
@@ -201,15 +205,11 @@ impl<K: Eq + Hash, V> LRUCache<K, V> {
 const NUM_SHARD_BITS: usize = 4;
 const NUM_SHARDS: usize = 1 << NUM_SHARD_BITS;
 
-pub trait HashKey: Hash {
-    fn hash_key(&self) -> u32;
-}
-
 pub struct ShardedLRUCache<K, V> {
     shard: [Mutex<LRUCache<K, V>>; NUM_SHARDS],
 }
 
-impl<K, V> ShardedLRUCache<K, V> where K: Eq + HashKey, V: Clone {
+impl<K, V> ShardedLRUCache<K, V> where K: Eq + HashKey, V: Clone + Usage {
     pub fn new(capacity: usize) -> Self {
         let per_shard_cap = (capacity + (NUM_SHARDS - 1)) / NUM_SHARDS;
         Self {

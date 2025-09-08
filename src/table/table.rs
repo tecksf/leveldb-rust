@@ -7,6 +7,7 @@ use crate::core::format::{Comparator, InternalKey, UserKey, ValueType};
 use crate::core::iterator::{IteratorGen, LevelIterator, TwoLevelIterator};
 use crate::table::block::{Block, BlockHandle, BlockIterator, Filter, Footer};
 use crate::table::cache::{BlockCache, BlockCacheKey};
+use crate::table::Usage;
 use crate::utils::bloom::{BloomFilterPolicy, InternalFilterPolicy};
 use crate::utils::coding;
 
@@ -189,6 +190,12 @@ impl<T: RandomReaderView> Table<T> {
         result.truncate(block_handle.size);
 
         Ok(result)
+    }
+}
+
+impl<T> Usage for Table<T> {
+    fn usage(&self) -> usize {
+        1
     }
 }
 

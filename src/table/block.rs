@@ -4,6 +4,7 @@ use std::io;
 use std::sync::Arc;
 use crate::{table, FilterPolicy};
 use crate::core::iterator::LevelIterator;
+use crate::table::Usage;
 use crate::utils::coding;
 
 #[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
@@ -68,6 +69,12 @@ impl Block {
 
     pub fn iter(&self, compare: fn(&[u8], &[u8]) -> Ordering) -> BlockIterator {
         BlockIterator::new(self.data.clone(), self.restart_offset, self.num_restarts() as usize, compare)
+    }
+}
+
+impl Usage for Block {
+    fn usage(&self) -> usize {
+        self.data.len()
     }
 }
 
