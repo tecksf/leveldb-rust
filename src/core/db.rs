@@ -204,8 +204,8 @@ impl Database {
             }
         }
 
-        let (result, statistics) = version.get(&lookup_key);
-        if version.update_statistics(&statistics) {
+        let (result, need_seek_compaction) = version.get(&lookup_key);
+        if need_seek_compaction {
             self.maybe_schedule_compaction();
         }
 

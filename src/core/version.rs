@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
 use std::{fs, io};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicI32, AtomicU32};
 use crate::core::format;
 use crate::core::format::{Comparator, InternalKey, LookupKey, UserKey};
@@ -81,22 +81,17 @@ impl Ord for FileMetaData {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct GetStatistics {
-    seek_file: Option<Arc<FileMetaData>>,
+    seek_file: Arc<FileMetaData>,
     seek_file_level: usize,
-}
-
-struct SeekCompactionInfo {
-    level: usize,
-    file: Arc<FileMetaData>,
 }
 
 pub struct Version {
     files: [Vec<Arc<FileMetaData>>; logs::NUM_LEVELS],
 
     // seek compaction
-    file_to_compact: RwLock<Option<SeekCompactionInfo>>,
+    file_to_compact: OnceLock<GetStatistics>,
 
     // size compaction
     compaction_score: f64,
@@ -108,7 +103,7 @@ impl Version {
     pub fn new(version_set: &VersionSet) -> Self {
         Self {
             files: Default::default(),
-            file_to_compact: RwLock::new(None),
+            file_to_compact: OnceLock::new(),
             compaction_level: 0,
             compaction_score: -1.0,
             table_cache: version_set.table_cache.clone(),
@@ -123,40 +118,26 @@ impl Version {
         user_key.cmp(&meta.smallest.extract_user_key()) == Ordering::Less
     }
 
-    pub fn update_statistics(&self, stats: &GetStatistics) -> bool {
-        if let Some(seek_file) = &stats.seek_file {
-            let count = seek_file.allowed_seeks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if count - 1 <= 0 {
-                if let Ok(mut guard) = self.file_to_compact.write() {
-                    if guard.is_none() {
-                        let seek = SeekCompactionInfo {
-                            file: seek_file.clone(),
-                            level: stats.seek_file_level,
-                        };
-                        *guard = Some(seek);
-                    }
-                }
-            }
-            return true;
+    fn update_statistics(&self, stats: &GetStatistics) -> bool {
+        let count = stats.seek_file.allowed_seeks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if count <= 0 && self.file_to_compact.get().is_none() {
+            return self.file_to_compact.set(stats.clone()).is_ok();
         }
+
         false
     }
 
-    pub fn get(&self, lookup_key: &LookupKey) -> (io::Result<Vec<u8>>, GetStatistics) {
+    pub fn get(&self, lookup_key: &LookupKey) -> (io::Result<Vec<u8>>, bool) {
         let internal_key = lookup_key.extract_internal_key();
         let mut result: io::Result<Vec<u8>> = Err(io::Error::new(io::ErrorKind::NotFound, ""));
-        let mut stats = GetStatistics::default();
-        let mut last_file_read: Option<Arc<FileMetaData>> = None;
-        let mut last_file_read_level: usize = 0;
+        let mut stats: Option<GetStatistics> = None;
+        let mut last_file: Option<GetStatistics> = None;
 
         let seek_wrapper = |level: usize, file: Arc<FileMetaData>| -> bool {
-            if stats.seek_file.is_none() && last_file_read.is_some() {
-                stats.seek_file = last_file_read.clone();
-                stats.seek_file_level = last_file_read_level;
+            if stats.is_none() && last_file.is_some() {
+                stats = last_file.clone();
             }
-
-            last_file_read = Some(file.clone());
-            last_file_read_level = level;
+            last_file = Some(GetStatistics { seek_file: file.clone(), seek_file_level: level });
 
             return match self.table_cache.get(file.number, file.file_size, &internal_key) {
                 Ok(table_result) => {
@@ -172,7 +153,8 @@ impl Version {
             };
         };
         self.for_each_overlapping(&internal_key, seek_wrapper);
-        (result, stats)
+        let need_seek_compaction = stats.map_or(false, |s| self.update_statistics(&s));
+        (result, need_seek_compaction)
     }
 
     pub fn pick_level_for_memory_table(&self, smallest: &UserKey, largest: &UserKey) -> usize {
@@ -816,12 +798,7 @@ impl VersionSet {
 
     pub fn needs_compaction(&self) -> bool {
         let current = self.latest_version();
-        if current.compaction_score >= 1.0 {
-            return true;
-        } else if let Ok(c) = current.file_to_compact.read() {
-            return c.is_some();
-        }
-        false
+        current.compaction_score >= 1.0 || current.file_to_compact.get().is_some()
     }
 
     pub fn add_live_files(&self) -> BTreeSet<u64> {
@@ -1079,10 +1056,10 @@ impl VersionSet {
             if compaction.inputs[0].is_empty() {
                 compaction.inputs[0].push(current.files[level][0].clone());
             }
-        } else if let Some(seek_compaction) = current.file_to_compact.read().unwrap().as_ref() {
-            level = seek_compaction.level;
-            compaction = Compaction::new(self.options, current.clone(), seek_compaction.level);
-            compaction.inputs[0].push(seek_compaction.file.clone());
+        } else if let Some(seek_compaction) = current.file_to_compact.get() {
+            level = seek_compaction.seek_file_level;
+            compaction = Compaction::new(self.options, current.clone(), level);
+            compaction.inputs[0].push(seek_compaction.seek_file.clone());
         } else {
             return None;
         }
