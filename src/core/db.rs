@@ -1,5 +1,5 @@
 use std::{fs, io, time};
-use std::collections::LinkedList;
+use std::collections::{BTreeSet, LinkedList};
 use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::Path;
@@ -536,6 +536,7 @@ impl DatabaseWrap {
         {
             let mut db = self.db_impl.lock();
             file_number = db.versions.get_new_file_number();
+            db.pending_outputs.insert(file_number);
         }
 
         let file_name = filename::make_table_file_name(self.name.as_str(), file_number);
@@ -566,6 +567,7 @@ impl DatabaseWrap {
         }
 
         let mut db = self.db_impl.lock();
+        compact.outputs.iter().for_each(|output| { db.pending_outputs.remove(&output.number); });
         db.stats[compact.compaction.level + 1].add_by(&compact.stats);
         db.versions.log_and_apply(&mut compact.compaction.edit)
     }
@@ -582,6 +584,7 @@ struct DatabaseImpl {
     stats: [CompactionStatistics; logs::NUM_LEVELS],
     agents: LinkedList<Arc<Agent>>,
     manual_compaction: Option<Arc<ManualCompaction>>,
+    pending_outputs: BTreeSet<u64>,
 }
 
 impl DatabaseImpl {
@@ -597,6 +600,7 @@ impl DatabaseImpl {
             stats: Default::default(),
             agents: LinkedList::new(),
             manual_compaction: None,
+            pending_outputs: BTreeSet::new(),
         }
     }
 
@@ -732,11 +736,8 @@ impl DatabaseImpl {
 
     fn write_level0_table(options: Options, db_name: &str, base: Option<&Version>, file_number: u64, table: &MemoryTable) -> io::Result<(usize, FileMetaData, u64)> {
         let start_micros = now_micros();
-        log::info!("level-0 table {}:started", file_number);
-
+        log::info!("write level-0 table {}:started", file_number);
         let meta = build_table(options, db_name, table.iter(), file_number)?;
-
-        log::info!("level-0 table {}: {} bytes", file_number, meta.file_size);
 
         let mut level = 0;
         if meta.file_size > 0 {
@@ -748,11 +749,14 @@ impl DatabaseImpl {
             }
         }
 
+        log::info!("choose level-{} table {}: {} bytes", level, file_number, meta.file_size);
+
         Ok((level, meta, now_micros() - start_micros))
     }
 
     fn remove_obsolete_files(&self) {
-        let live_files = self.versions.add_live_files();
+        let mut live_files = self.versions.add_live_files();
+        live_files.extend(self.pending_outputs.iter());
         let mut files_to_delete = Vec::<OsString>::new();
         let filenames = file::get_all_filenames(self.name.as_str());
         for filename in filenames {
