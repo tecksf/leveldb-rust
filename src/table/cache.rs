@@ -191,14 +191,23 @@ impl<K: Eq + Hash, V: Usage> LRUCache<K, V> {
         if self.usage >= self.capacity {
             let link = self.lru.pop_front().unwrap();
             self.table.retain(|_, v| *v != link);
-            Node::release(link);
             unsafe { self.usage -= (*link).value.usage(); }
+            Node::release(link);
         }
 
         self.usage += value.usage();
         let link = Node::new_link(value);
         self.table.insert(key, link);
         self.lru.push_back(link);
+    }
+
+    fn erase(&mut self, key: &K) {
+        if let Some(&link) = self.table.get(key) {
+            self.lru.pop(link);
+            self.table.retain(|_, v| *v != link);
+            unsafe { self.usage -= (*link).value.usage(); }
+            Node::release(link);
+        }
     }
 }
 
@@ -231,6 +240,13 @@ impl<K, V> ShardedLRUCache<K, V> where K: Eq + HashKey, V: Clone + Usage {
         let slot = key.hash_key();
         if let Ok(mut cache) = self.shard[Self::shard(slot)].lock() {
             cache.add(key, value);
+        }
+    }
+
+    pub fn erase(&self, key: &K) {
+        let slot = key.hash_key();
+        if let Ok(mut cache) = self.shard[Self::shard(slot)].lock() {
+            cache.erase(key);
         }
     }
 }
@@ -275,6 +291,10 @@ impl TableCache {
             value = table.internal_get(key);
         }
         value
+    }
+
+    pub fn evict(&self, file_number: u64) {
+        self.cache.erase(&file_number);
     }
 
     fn find_table(&self, file_number: u64, file_size: u64) -> io::Result<SSTable> {

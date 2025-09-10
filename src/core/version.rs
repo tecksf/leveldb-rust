@@ -597,6 +597,19 @@ impl VersionEdit {
 
         Ok(())
     }
+
+    pub fn message(&self) -> String {
+        let mut msg = String::from("Add files:");
+        for (level, meta) in &self.new_files {
+            msg += &format!(" [l{}-{}]", level, meta.number);
+        }
+
+        msg.push_str(" Delete files:");
+        for (level, file_number) in &self.deleted_files {
+            msg += &format!(" [l{}-{}]", level, file_number);
+        }
+        msg
+    }
 }
 
 #[derive(Default)]
@@ -696,7 +709,7 @@ pub struct VersionSet {
 }
 
 impl VersionSet {
-    pub fn new(db_name: &str, options: Options) -> Self {
+    pub fn new(db_name: &str, options: Options, table_cache: Arc<TableCache>) -> Self {
         let mut set = VersionSet {
             db_name: String::from(db_name),
             options,
@@ -708,7 +721,7 @@ impl VersionSet {
             manifest_file_number: 0,
             manifest_logger: None,
             compact_pointers: Default::default(),
-            table_cache: Arc::new(TableCache::new(db_name, options, options.max_open_files - 10)),
+            table_cache,
         };
         set.versions.push_back(Arc::new(Version::new(&set)));
         set
@@ -757,6 +770,17 @@ impl VersionSet {
     pub fn reuse_file_number(&mut self, number: u64) {
         if self.next_file_number == number + 1 {
             self.next_file_number = number;
+        }
+    }
+
+    pub fn cleanup_useless_versions(&mut self) {
+        while self.versions.len() > 1 {
+            let v = self.versions.front().unwrap();
+            if Arc::strong_count(v) == 1 {
+                self.versions.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -1230,7 +1254,8 @@ mod tests {
             ("200", "400"),
             ("500", "800"),
         ];
-        let version_set = VersionSet::new("test", Options::default());
+        let table_cache = Arc::new(TableCache::new("test", Options::default(), 8));
+        let version_set = VersionSet::new("test", Options::default(), table_cache);
         let mut version = Version::new(&version_set);
         for i in 0..4usize {
             version.files[0].push(Arc::new(create_file_meta(i as u64, keys[i].0, keys[i].1)));
@@ -1263,7 +1288,8 @@ mod tests {
 
         version.compaction_level = 0;
         version.compaction_score = 1.2;
-        let mut version_set = VersionSet::new("test", Options::default());
+        let table_cache = Arc::new(TableCache::new("test", Options::default(), 8));
+        let mut version_set = VersionSet::new("test", Options::default(), table_cache);
         version_set.compact_pointers[0] = InternalKey::restore("280", 9, ValueType::Insertion);
         version_set.append_version(version);
         let compaction = version_set.pick_compaction().unwrap();
@@ -1293,7 +1319,8 @@ mod tests {
 
     #[test]
     fn test_merge_multi_version_edit() {
-        let mut version_set = VersionSet::new("test", Options::default());
+        let table_cache = Arc::new(TableCache::new("test", Options::default(), 8));
+        let mut version_set = VersionSet::new("test", Options::default(), table_cache);
         let base_version = Arc::new(Version::new(&version_set));
         let mut builder = VersionBuilder::new(&mut version_set, base_version);
 

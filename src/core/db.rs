@@ -21,6 +21,7 @@ use crate::logs::file::WritableFile;
 use crate::logs::{file, filename, wal};
 use crate::logs::filename::FileType;
 use crate::table::builder::TableBuilder;
+use crate::table::cache::TableCache;
 use crate::utils::common::now_micros;
 
 struct Agent {
@@ -404,7 +405,12 @@ impl DatabaseWrap {
                 let input = db.versions.make_input_iterator(compact.compaction);
 
                 drop(db);
-                let _ = self.do_compaction_work(&mut compact, &input);
+                let result = self.do_compaction_work(&mut compact, &input);
+                if result.is_ok() {
+                    db = self.db_impl.lock();
+                    db.versions.cleanup_useless_versions();
+                    db.remove_obsolete_files();
+                }
             }
         }
         self.background_compaction_scheduled.store(false, Ordering::Relaxed);
@@ -446,6 +452,7 @@ impl DatabaseWrap {
         if status.is_ok() {
             self.has_imm.store(false, Ordering::Release);
             db.immutable = None;
+            db.versions.cleanup_useless_versions();
             db.remove_obsolete_files();
         }
     }
@@ -549,12 +556,6 @@ impl DatabaseWrap {
     }
 
     fn install_compaction_results(&self, compact: &mut CompactionState) -> io::Result<()> {
-        log::info!("Compacted {}@{} + {}@{} files => {} bytes",
-            compact.compaction.inputs[0].len(), compact.compaction.level,
-            compact.compaction.inputs[1].len(), compact.compaction.level + 1,
-            compact.total_bytes
-        );
-
         let level = compact.compaction.level;
         for which in 0..2 {
             for input in &compact.compaction.inputs[which] {
@@ -565,6 +566,12 @@ impl DatabaseWrap {
         for output in &compact.outputs {
             compact.compaction.edit.add_file(level + 1, output.clone());
         }
+
+        log::info!("Compacted {}@{} + {}@{} files => {} bytes, {}",
+            compact.compaction.inputs[0].len(), compact.compaction.level,
+            compact.compaction.inputs[1].len(), compact.compaction.level + 1,
+            compact.total_bytes, compact.compaction.edit.message()
+        );
 
         let mut db = self.db_impl.lock();
         compact.outputs.iter().for_each(|output| { db.pending_outputs.remove(&output.number); });
@@ -585,10 +592,12 @@ struct DatabaseImpl {
     agents: LinkedList<Arc<Agent>>,
     manual_compaction: Option<Arc<ManualCompaction>>,
     pending_outputs: BTreeSet<u64>,
+    table_cache: Arc<TableCache>,
 }
 
 impl DatabaseImpl {
     pub fn new(path: &str, options: Options) -> Self {
+        let table_cache = Arc::new(TableCache::new(path, options, options.max_open_files - 10));
         Self {
             name: String::from(path),
             options,
@@ -596,11 +605,12 @@ impl DatabaseImpl {
             log_file_number: 0,
             mutable: Arc::new(MemoryTable::new()),
             immutable: None,
-            versions: VersionSet::new(path, options),
+            versions: VersionSet::new(path, options, table_cache.clone()),
             stats: Default::default(),
             agents: LinkedList::new(),
             manual_compaction: None,
             pending_outputs: BTreeSet::new(),
+            table_cache,
         }
     }
 
@@ -770,6 +780,9 @@ impl DatabaseImpl {
 
                 if !keep {
                     files_to_delete.push(filename);
+                    if file_type == FileType::TableFile {
+                        self.table_cache.evict(number);
+                    }
                     log::info!("Delete type={:?}, number={}", file_type, number);
                 }
             }
