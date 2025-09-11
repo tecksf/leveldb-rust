@@ -4,6 +4,7 @@ mod logs;
 mod table;
 
 pub type DB = core::db::Database;
+pub use core::batch::WriteBatch;
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
